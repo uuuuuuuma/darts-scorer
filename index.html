@@ -1,0 +1,1660 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Darts Scorer</title>
+<meta name="description" content="01・クリケット対応のダーツスコアカウンター（80%/100%スタッツ、アウト方式、ハンデ、履歴、DARTSLIVEアワード対応）" />
+<link rel="icon" href="data:,">
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js" crossorigin></script>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  html, body { margin: 0; padding: 0; background: #0F1B15; }
+  #root { min-height: 100dvh; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script>
+  // ---- localStorage-backed replacement for the Claude-artifact "window.storage" API ----
+  window.storage = {
+    async get(key, shared) {
+      const raw = window.localStorage.getItem(key);
+      if (raw === null) throw new Error("key not found: " + key);
+      return { key, value: raw, shared: !!shared };
+    },
+    async set(key, value, shared) {
+      window.localStorage.setItem(key, value);
+      return { key, value, shared: !!shared };
+    },
+    async delete(key, shared) {
+      window.localStorage.removeItem(key);
+      return { key, deleted: true, shared: !!shared };
+    },
+    async list(prefix, shared) {
+      const keys = Object.keys(window.localStorage).filter((k) => !prefix || k.startsWith(prefix));
+      return { keys, prefix, shared: !!shared };
+    },
+  };
+</script>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useRef } = React;
+
+
+// ---- palette / tokens -------------------------------------------------
+const C = {
+  bg: "#0F1B15",
+  panel: "#16241C",
+  panel2: "#1C2C22",
+  border: "#33453A",
+  borderLight: "#44594C",
+  cream: "#F1E9D6",
+  creamDim: "#C9C2AE",
+  muted: "#8FA396",
+  red: "#C1442D",
+  redDim: "#7A2C1D",
+  gold: "#C9A227",
+  goldDim: "#8A6F1B",
+  win: "#4C8C5B",
+};
+
+const CRICKET_NUMBERS = ["20", "19", "18", "17", "16", "15"];
+const CRICKET_TARGETS = [...CRICKET_NUMBERS, "B"];
+const NUM_GRID = Array.from({ length: 20 }, (_, i) => 20 - i);
+
+function targetLabel(t) {
+  return t === "B" ? "Bull" : t;
+}
+function targetValue(t) {
+  return t === "B" ? 25 : Number(t);
+}
+function segLabel(seg, mult) {
+  if (seg === "MISS") return "Miss";
+  if (seg === "B") return mult === 2 ? "D-Bull" : "Bull";
+  const pre = mult === 3 ? "T" : mult === 2 ? "D" : "S";
+  return `${pre}${seg}`;
+}
+function fmt2(n) {
+  return (Math.round(n * 100) / 100).toFixed(2);
+}
+function computeAvg01(points, darts) {
+  return darts > 0 ? fmt2((points / darts) * 3) : "0.00";
+}
+function computeMPR(marks, darts) {
+  const rounds = darts / 3;
+  return rounds > 0 ? fmt2(marks / rounds) : "0.00";
+}
+function deepClone(x) {
+  return JSON.parse(JSON.stringify(x));
+}
+function fmtDate(iso) {
+  const d = new Date(iso);
+  return `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()} ${String(
+    d.getHours()
+  ).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
+
+// DARTSLIVE default round limits
+function defaultMaxRounds(gameType, variant) {
+  if (gameType === "01") return variant >= 901 ? 20 : 15;
+  return 20; // Standard Cricket
+}
+
+// ---- DARTSLIVE2 AUTO HANDICAP tables (official, integer rating gaps) ----
+const VARIANTS_01 = [301, 501, 701, 901, 1101, 1501];
+const AUTO_01_TABLE = {
+  1: [283, 471, 659, 847, 1035, 1411],
+  2: [265, 441, 617, 793, 969, 1321],
+  3: [247, 411, 575, 739, 903, 1231],
+  4: [229, 381, 533, 685, 837, 1141],
+  5: [211, 351, 491, 631, 771, 1051],
+  6: [193, 321, 449, 577, 705, 961],
+  7: [181, 291, 407, 523, 639, 871],
+  8: [181, 261, 365, 469, 573, 781],
+};
+const AUTO_01_FLOOR = [181, 251, 351, 451, 551, 751]; // rating gap >= 9
+
+// weaker player's handicapped starting score (stronger player plays the plain variant)
+function auto01Start(diff, variant) {
+  if (diff <= 0) return variant;
+  const idx = VARIANTS_01.indexOf(variant);
+  if (idx === -1) return variant;
+  const d = Math.min(Math.round(diff), 17);
+  if (d >= 9) return AUTO_01_FLOOR[idx];
+  return AUTO_01_TABLE[d][idx];
+}
+
+const AUTO_CRICKET_TABLE = {
+  1: { marks: { 18: 1 }, score: 8 },
+  2: { marks: { 18: 2 }, score: 16 },
+  3: { marks: { 18: 2, 17: 1 }, score: 24 },
+  4: { marks: { 18: 2, 17: 2 }, score: 32 },
+  5: { marks: { 18: 2, 17: 2, 16: 1 }, score: 40 },
+  6: { marks: { 18: 2, 17: 2, 16: 2 }, score: 48 },
+  7: { marks: { 18: 2, 17: 2, 16: 2, 15: 1 }, score: 56 },
+  8: { marks: { 18: 2, 17: 2, 16: 2, 15: 2 }, score: 64 },
+};
+// weaker player's pre-set marks (on 18/17/16/15) and bonus starting score
+function autoCricketHandicap(diff) {
+  if (diff <= 0) return { marks: {}, score: 0 };
+  const d = Math.min(Math.round(diff), 17);
+  if (d <= 8) return AUTO_CRICKET_TABLE[d];
+  const base = AUTO_CRICKET_TABLE[8];
+  return { marks: base.marks, score: base.score + (d - 8) * 24 };
+}
+
+// ---- DARTSLIVE AWARD conditions ---------------------------------------
+// darts: [{ seg, mult, value }]  seg: number(1-20) | "20".."15" | "B" | "MISS"
+function evaluateAwards(gameType, darts, opts) {
+  const found = [];
+  const n = darts.length;
+  const isBull = (d) => d.seg === "B";
+  const isInner = (d) => d.seg === "B" && d.mult === 2;
+  const bulls = darts.filter(isBull);
+  const total = darts.reduce((s, d) => s + d.value, 0);
+  const markValue = (d) => (d.seg === "B" ? Math.min(d.mult, 2) : d.mult);
+
+  if (opts && opts.highOut) found.push("HIGH OUT");
+
+  if (n === 3 && bulls.length === 3) {
+    found.push(darts.every(isInner) ? "THREE IN THE BLACK" : "HAT TRICK");
+  } else if (n === 3) {
+    const segs = darts.map((d) => String(d.seg));
+    const allSameSeg = segs.every((s) => s === segs[0]) && !isBull(darts[0]) && segs[0] !== "MISS";
+    let matched = false;
+    if (allSameSeg) {
+      const mults = darts.map((d) => d.mult);
+      const allSameMult = mults.every((m) => m === mults[0]);
+      if (allSameMult && mults[0] === 3 && Number(segs[0]) === 20) {
+        found.push("TON 80");
+        matched = true;
+      } else if (allSameMult && (mults[0] === 2 || mults[0] === 3)) {
+        found.push("THREE IN A BED");
+        matched = true;
+      }
+    }
+    if (!matched && gameType === "cricket") {
+      const allTriple = darts.every((d) => d.mult === 3 && !isBull(d) && d.seg !== "MISS");
+      const uniqueSegs = new Set(segs);
+      if (allTriple && uniqueSegs.size === 3) {
+        found.push("WHITE HORSE");
+        matched = true;
+      }
+    }
+    if (!matched) {
+      if (gameType === "cricket") {
+        const marks = darts.filter((d) => d.seg !== "MISS").reduce((s, d) => s + markValue(d), 0);
+        if (marks >= 5) found.push(`${marks} COUNT`);
+      } else {
+        if (total >= 151 && total <= 180) found.push("HIGH TON");
+        else if (total >= 100 && total <= 150) found.push("LOW TON");
+      }
+      if (found.length === 0 && bulls.length >= 1) found.push("ONE BULL");
+    }
+  } else {
+    // fewer than 3 darts thrown this turn (e.g. bust on 1st/2nd dart)
+    if (gameType === "cricket") {
+      const marks = darts.filter((d) => d.seg !== "MISS").reduce((s, d) => s + markValue(d), 0);
+      if (marks >= 5) found.push(`${marks} COUNT`);
+    } else {
+      if (total >= 151 && total <= 180) found.push("HIGH TON");
+      else if (total >= 100 && total <= 150) found.push("LOW TON");
+    }
+    if (!found.length && bulls.length >= 1) found.push("ONE BULL");
+  }
+  return found;
+}
+
+function DartsScorer() {
+  const [screen, setScreen] = useState("setup"); // setup | game | result | history
+  const [gameType, setGameType] = useState("01"); // '01' | 'cricket'
+  const [variant, setVariant] = useState(501);
+  const [numPlayers, setNumPlayers] = useState(2);
+  const [playerNames, setPlayerNames] = useState(["プレイヤー1", "プレイヤー2"]);
+  const [maxRounds, setMaxRounds] = useState(defaultMaxRounds("01", 501));
+  const [roundsTouched, setRoundsTouched] = useState(false);
+  const [outMode, setOutMode] = useState("double"); // 'single' | 'double' | 'master'
+  const [bullMode, setBullMode] = useState("fat"); // 'fat' | 'separate' (01 games only; Cricket always uses fat bull)
+  const [handicapMode, setHandicapMode] = useState("none"); // 'none' | 'auto' | 'manual'
+  const [playerRatings, setPlayerRatings] = useState([0, 0]);
+  const [manualHandicaps, setManualHandicaps] = useState([0, 0]);
+
+  const [players, setPlayers] = useState([]);
+  const [currentIdx, setCurrentIdx] = useState(0);
+  const [turnDarts, setTurnDarts] = useState([]);
+  const [multiplier, setMultiplier] = useState(1);
+  const [round, setRound] = useState(1);
+  const [reached80, setReached80] = useState(false);
+  const [message, setMessage] = useState("");
+  const [awardMsg, setAwardMsg] = useState(null);
+  const [awardLog, setAwardLog] = useState([]);
+  const [undoStack, setUndoStack] = useState([]);
+  const [result, setResult] = useState(null);
+
+  const [history, setHistory] = useState([]);
+  const msgTimer = useRef(null);
+  const awardTimer = useRef(null);
+
+  // ---- load history from persistent storage ----
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await window.storage.get("darts_history", false);
+        if (res && res.value) setHistory(JSON.parse(res.value));
+      } catch (e) {
+        // no history yet
+      }
+    })();
+  }, []);
+
+  useEffect(() => {
+    setPlayerNames((prev) => {
+      const next = [...prev];
+      while (next.length < numPlayers) next.push(`プレイヤー${next.length + 1}`);
+      while (next.length > numPlayers) next.pop();
+      return next;
+    });
+    setPlayerRatings((prev) => {
+      const next = [...prev];
+      while (next.length < numPlayers) next.push(0);
+      while (next.length > numPlayers) next.pop();
+      return next;
+    });
+    setManualHandicaps((prev) => {
+      const next = [...prev];
+      while (next.length < numPlayers) next.push(0);
+      while (next.length > numPlayers) next.pop();
+      return next;
+    });
+  }, [numPlayers]);
+
+  // keep round-limit default in sync unless the user has adjusted it manually
+  useEffect(() => {
+    if (!roundsTouched) setMaxRounds(defaultMaxRounds(gameType, variant));
+  }, [gameType, variant, roundsTouched]);
+
+  function flash(text) {
+    setMessage(text);
+    if (msgTimer.current) clearTimeout(msgTimer.current);
+    msgTimer.current = setTimeout(() => setMessage(""), 1400);
+  }
+  function flashAward(text) {
+    setAwardMsg(text);
+    if (awardTimer.current) clearTimeout(awardTimer.current);
+    awardTimer.current = setTimeout(() => setAwardMsg(null), 2000);
+  }
+
+  function saveHistoryRecord(record) {
+    setHistory((prev) => {
+      const updated = [record, ...prev].slice(0, 200);
+      window.storage.set("darts_history", JSON.stringify(updated), false).catch(() => {});
+      return updated;
+    });
+  }
+  function deleteHistoryItem(id) {
+    setHistory((prev) => {
+      const updated = prev.filter((r) => r.id !== id);
+      window.storage.set("darts_history", JSON.stringify(updated), false).catch(() => {});
+      return updated;
+    });
+  }
+  function clearHistory() {
+    setHistory([]);
+    window.storage.set("darts_history", JSON.stringify([]), false).catch(() => {});
+  }
+
+  // ---- setup ----
+  function startGame() {
+    const names = playerNames.map((n, i) => (n.trim() ? n.trim() : `プレイヤー${i + 1}`));
+    const maxRating = handicapMode === "auto" ? Math.max(...playerRatings) : null;
+
+    let np;
+    if (gameType === "01") {
+      np = names.map((name, i) => {
+        let start = variant;
+        if (handicapMode === "auto") {
+          start = auto01Start(maxRating - playerRatings[i], variant);
+        } else if (handicapMode === "manual") {
+          start = Math.max(2, variant - (manualHandicaps[i] || 0));
+        }
+        return {
+          name,
+          start,
+          remaining: start,
+          turnStartRemaining: start,
+          dartsThrown: 0,
+          points: 0,
+          snapshot80: null,
+          finished: false,
+        };
+      });
+    } else {
+      np = names.map((name, i) => {
+        const marks = {};
+        CRICKET_TARGETS.forEach((t) => (marks[t] = 0));
+        let points = 0;
+        if (handicapMode === "auto") {
+          const hc = autoCricketHandicap(maxRating - playerRatings[i]);
+          Object.keys(hc.marks).forEach((t) => (marks[t] = hc.marks[t]));
+          points = hc.score;
+        } else if (handicapMode === "manual") {
+          points = manualHandicaps[i] || 0;
+        }
+        const totalMarks = Object.values(marks).reduce((s, v) => s + v, 0);
+        return {
+          name,
+          marks,
+          totalMarks,
+          points,
+          dartsThrown: 0,
+          snapshot80: null,
+          finished: false,
+        };
+      });
+    }
+    setPlayers(np);
+    setCurrentIdx(0);
+    setTurnDarts([]);
+    setRound(1);
+    setReached80(false);
+    setUndoStack([]);
+    setResult(null);
+    setMessage("");
+    setAwardMsg(null);
+    setAwardLog([]);
+    setScreen("game");
+  }
+
+  function backToSetup() {
+    setScreen("setup");
+  }
+
+  // ---- gameplay ----
+  function pushUndo() {
+    setUndoStack((prev) => [
+      ...prev,
+      {
+        players: deepClone(players),
+        currentIdx,
+        turnDarts: deepClone(turnDarts),
+        round,
+        reached80,
+      },
+    ]);
+  }
+
+  function undo() {
+    if (undoStack.length === 0) return;
+    const last = undoStack[undoStack.length - 1];
+    setUndoStack((prev) => prev.slice(0, -1));
+    setPlayers(last.players);
+    setCurrentIdx(last.currentIdx);
+    setTurnDarts(last.turnDarts);
+    setRound(last.round);
+    setReached80(last.reached80);
+    setMessage("");
+  }
+
+  function finalizeGame(finalPlayers, winners) {
+    let resultsPlayers;
+    if (gameType === "01") {
+      resultsPlayers = finalPlayers.map((p) => {
+        const s80 = p.snapshot80 || { points: p.points, darts: p.dartsThrown };
+        return {
+          name: p.name,
+          avg80: computeAvg01(s80.points, s80.darts),
+          avg100: computeAvg01(p.points, p.dartsThrown),
+          isWinner: winners.includes(p.name),
+        };
+      });
+    } else {
+      resultsPlayers = finalPlayers.map((p) => {
+        const s80 = p.snapshot80 || { marks: p.totalMarks, darts: p.dartsThrown };
+        return {
+          name: p.name,
+          mpr80: computeMPR(s80.marks, s80.darts),
+          mpr100: computeMPR(p.totalMarks, p.dartsThrown),
+          points: p.points,
+          isWinner: winners.includes(p.name),
+        };
+      });
+    }
+    const record = {
+      id: Date.now(),
+      date: new Date().toISOString(),
+      gameType,
+      variant: gameType === "01" ? variant : null,
+      winnerName: winners.length > 1 ? `${winners.join(" / ")}（引き分け）` : winners[0],
+      players: resultsPlayers,
+      awards: awardLog,
+    };
+    setResult(record);
+    setScreen("result");
+    saveHistoryRecord(record);
+  }
+
+  function finalizeByRoundLimit(newPlayers) {
+    let winners;
+    if (gameType === "01") {
+      const minRem = Math.min(...newPlayers.map((p) => p.remaining));
+      winners = newPlayers.filter((p) => p.remaining === minRem).map((p) => p.name);
+    } else {
+      const maxPts = Math.max(...newPlayers.map((p) => p.points));
+      winners = newPlayers.filter((p) => p.points === maxPts).map((p) => p.name);
+    }
+    finalizeGame(newPlayers, winners);
+  }
+
+  function recordAwards(names) {
+    if (!names.length) return;
+    flashAward(names.join(" & "));
+    setAwardLog((prev) => [
+      ...prev,
+      ...names.map((a) => ({ player: players[currentIdx]?.name, award: a, round })),
+    ]);
+  }
+
+  function throwDart(seg) {
+    if (screen !== "game") return;
+    pushUndo();
+    const newPlayers = deepClone(players);
+    const p = newPlayers[currentIdx];
+    if (turnDarts.length === 0) {
+      if (gameType === "01") p.turnStartRemaining = p.remaining;
+    }
+    const rawMult = seg === "B" ? Math.min(multiplier, 2) : multiplier;
+    const scoreMult = gameType === "01" && seg === "B" && bullMode === "fat" ? 2 : rawMult;
+    const label = segLabel(seg, rawMult);
+    let turnEndsNow = false;
+    let justFinished = false;
+    let highOutFlag = false;
+    let dartValue = 0;
+
+    if (gameType === "01") {
+      const value = seg === "MISS" ? 0 : seg === "B" ? (scoreMult === 2 ? 50 : 25) : seg * scoreMult;
+      dartValue = value;
+      const newRemaining = p.remaining - value;
+      const validFinish =
+        outMode === "single" ? true : outMode === "master" ? scoreMult === 2 || scoreMult === 3 : scoreMult === 2;
+      p.dartsThrown += 1;
+      if (newRemaining < 0 || (newRemaining === 1 && outMode !== "single") || (newRemaining === 0 && !validFinish)) {
+        p.remaining = p.turnStartRemaining;
+        turnEndsNow = true;
+        flash(`${p.name} バースト`);
+      } else if (newRemaining === 0 && validFinish) {
+        p.remaining = 0;
+        p.points += value;
+        if (!p.snapshot80 && p.remaining <= p.start * 0.2) {
+          p.snapshot80 = { points: p.points, darts: p.dartsThrown };
+        }
+        p.finished = true;
+        justFinished = true;
+        if (p.turnStartRemaining >= 100) highOutFlag = true;
+        flash(`${p.name} チェックアウト！`);
+      } else {
+        p.remaining = newRemaining;
+        p.points += value;
+        if (!p.snapshot80 && p.remaining <= p.start * 0.2) {
+          p.snapshot80 = { points: p.points, darts: p.dartsThrown };
+        }
+      }
+    } else {
+      p.dartsThrown += 1;
+      if (seg !== "MISS") {
+        const hits = rawMult;
+        const c = p.marks[seg] || 0;
+        const closeNeeded = Math.max(0, 3 - c);
+        const usedToClose = Math.min(hits, closeNeeded);
+        const remainingHits = hits - usedToClose;
+        const value = targetValue(seg);
+        dartValue = value * hits;
+        if (remainingHits > 0) {
+          const opponentsOpen = newPlayers.some(
+            (op, i) => i !== currentIdx && (op.marks[seg] || 0) < 3
+          );
+          if (opponentsOpen) p.points += remainingHits * value;
+        }
+        p.marks[seg] = c + hits;
+        p.totalMarks = (p.totalMarks || 0) + hits;
+      }
+      let justReached80 = false;
+      if (!reached80) {
+        const allClosed = CRICKET_TARGETS.every((t) => (p.marks[t] || 0) >= 3);
+        if (allClosed) {
+          newPlayers.forEach((pl) => {
+            pl.snapshot80 = { marks: pl.totalMarks || 0, darts: pl.dartsThrown };
+          });
+          justReached80 = true;
+        }
+      }
+      if (justReached80) setReached80(true);
+
+      const pAllClosed = CRICKET_TARGETS.every((t) => (p.marks[t] || 0) >= 3);
+      if (pAllClosed) {
+        const others = newPlayers.filter((_, i) => i !== currentIdx).map((pl) => pl.points);
+        const maxOther = others.length ? Math.max(...others) : 0;
+        if (p.points >= maxOther) {
+          p.finished = true;
+          justFinished = true;
+          flash(`${p.name} クローズ！`);
+        }
+      }
+    }
+
+    setPlayers(newPlayers);
+    const newTurnDarts = [...turnDarts, { label, seg, mult: rawMult, value: dartValue }];
+    const isTurnOver = turnEndsNow || justFinished || newTurnDarts.length >= 3;
+
+    if (isTurnOver) {
+      const foundAwards = evaluateAwards(gameType, newTurnDarts, { highOut: highOutFlag });
+      if (foundAwards.length) recordAwards(foundAwards);
+    }
+
+    if (justFinished) {
+      setTurnDarts(newTurnDarts);
+      finalizeGame(newPlayers, [p.name]);
+      return;
+    }
+
+    if (isTurnOver) {
+      setTurnDarts([]);
+      const nextIdx = (currentIdx + 1) % newPlayers.length;
+      if (nextIdx === 0) {
+        if (round >= maxRounds) {
+          finalizeByRoundLimit(newPlayers);
+          setMultiplier(1);
+          return;
+        }
+        setRound((r) => r + 1);
+      }
+      setCurrentIdx(nextIdx);
+    } else {
+      setTurnDarts(newTurnDarts);
+    }
+    setMultiplier(1);
+  }
+
+  // =========================================================================
+  return (
+    <div
+      className="w-full flex justify-center"
+      style={{
+        background: C.bg,
+        fontFamily: "Inter, sans-serif",
+        color: C.cream,
+        minHeight: "100dvh",
+      }}
+    >
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Inter:wght@400;500;600;700&display=swap');
+        .disp { font-family: 'Bebas Neue', 'Inter', sans-serif; letter-spacing: 0.02em; }
+        * { box-sizing: border-box; }
+        button { font-family: inherit; touch-action: manipulation; -webkit-tap-highlight-color: transparent; user-select: none; }
+        input { font-size: 16px; }
+        ::selection { background: ${C.gold}; color: #1a1a1a; }
+        @media (max-width: 380px) {
+          .num-grid button { font-size: 13px !important; padding-top: 8px !important; padding-bottom: 8px !important; }
+        }
+      `}</style>
+      <div
+        className="w-full max-w-md flex flex-col"
+        style={{
+          background: C.bg,
+          minHeight: "100dvh",
+          paddingTop: "env(safe-area-inset-top)",
+          paddingBottom: "env(safe-area-inset-bottom)",
+        }}
+      >
+        {screen === "setup" && (
+          <SetupScreen
+            gameType={gameType}
+            setGameType={setGameType}
+            variant={variant}
+            setVariant={setVariant}
+            numPlayers={numPlayers}
+            setNumPlayers={setNumPlayers}
+            playerNames={playerNames}
+            setPlayerNames={setPlayerNames}
+            outMode={outMode}
+            setOutMode={setOutMode}
+            bullMode={bullMode}
+            setBullMode={setBullMode}
+            handicapMode={handicapMode}
+            setHandicapMode={setHandicapMode}
+            playerRatings={playerRatings}
+            setPlayerRatings={setPlayerRatings}
+            manualHandicaps={manualHandicaps}
+            setManualHandicaps={setManualHandicaps}
+            maxRounds={maxRounds}
+            setMaxRounds={(v) => {
+              setRoundsTouched(true);
+              setMaxRounds(v);
+            }}
+            resetRoundsDefault={() => {
+              setRoundsTouched(false);
+              setMaxRounds(defaultMaxRounds(gameType, variant));
+            }}
+            startGame={startGame}
+            goHistory={() => setScreen("history")}
+            hasHistory={history.length > 0}
+          />
+        )}
+        {screen === "game" && gameType === "01" && (
+          <Game01Screen
+            players={players}
+            variant={variant}
+            currentIdx={currentIdx}
+            turnDarts={turnDarts}
+            multiplier={multiplier}
+            setMultiplier={setMultiplier}
+            round={round}
+            maxRounds={maxRounds}
+            outMode={outMode}
+            bullMode={bullMode}
+            message={message}
+            awardMsg={awardMsg}
+            onThrow={throwDart}
+            onUndo={undo}
+            canUndo={undoStack.length > 0}
+            onExit={backToSetup}
+          />
+        )}
+        {screen === "game" && gameType === "cricket" && (
+          <GameCricketScreen
+            players={players}
+            currentIdx={currentIdx}
+            turnDarts={turnDarts}
+            multiplier={multiplier}
+            setMultiplier={setMultiplier}
+            round={round}
+            maxRounds={maxRounds}
+            message={message}
+            awardMsg={awardMsg}
+            onThrow={throwDart}
+            onUndo={undo}
+            canUndo={undoStack.length > 0}
+            onExit={backToSetup}
+          />
+        )}
+        {screen === "result" && result && (
+          <ResultScreen
+            result={result}
+            onRematch={startGame}
+            onSetup={() => setScreen("setup")}
+            onHistory={() => setScreen("history")}
+          />
+        )}
+        {screen === "history" && (
+          <HistoryScreen
+            history={history}
+            onBack={() => setScreen("setup")}
+            onDelete={deleteHistoryItem}
+            onClear={clearHistory}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ============================== SETUP ====================================
+function SetupScreen({
+  gameType, setGameType, variant, setVariant, numPlayers, setNumPlayers,
+  playerNames, setPlayerNames, outMode, setOutMode,
+  bullMode, setBullMode,
+  handicapMode, setHandicapMode, playerRatings, setPlayerRatings,
+  manualHandicaps, setManualHandicaps,
+  maxRounds, setMaxRounds, resetRoundsDefault,
+  startGame, goHistory, hasHistory,
+}) {
+  const [showDetail, setShowDetail] = useState(false);
+  const [showRating, setShowRating] = useState(false);
+
+  const handicapSummary =
+    handicapMode === "none" ? "なし" : handicapMode === "auto" ? "オートハンデ" : "マニュアル";
+  const bullSummary = bullMode === "separate" ? "セパレートブル" : "ファットブル";
+  const detailSummary =
+    gameType === "01"
+      ? `${OUT_MODE_LABEL[outMode]} ・ ${bullSummary} ・ ハンデ: ${handicapSummary}`
+      : `ハンデ: ${handicapSummary}`;
+
+  return (
+    <div className="flex-1 flex flex-col px-5 pt-8 sm:pt-10 pb-8">
+      <div className="mb-6 sm:mb-8">
+        <div className="disp" style={{ fontSize: "clamp(30px,8vw,40px)", lineHeight: 1, color: C.cream }}>
+          Darts Scorer
+        </div>
+        <div style={{ color: C.muted, fontSize: 13, marginTop: 4 }}>
+          01・クリケット対応 スコアカウンター
+        </div>
+      </div>
+
+      <Section title="ゲーム形式">
+        <div className="flex gap-2">
+          {[
+            { k: "01", label: "ゼロワン" },
+            { k: "cricket", label: "クリケット" },
+          ].map((o) => (
+            <ChoiceButton key={o.k} active={gameType === o.k} onClick={() => setGameType(o.k)}>
+              {o.label}
+            </ChoiceButton>
+          ))}
+        </div>
+      </Section>
+
+      {gameType === "01" && (
+        <Section title="持ち点">
+          <div className="flex gap-2">
+            {[301, 501, 701].map((v) => (
+              <ChoiceButton key={v} active={variant === v} onClick={() => setVariant(v)}>
+                {v}
+              </ChoiceButton>
+            ))}
+          </div>
+        </Section>
+      )}
+
+      <Section title="人数">
+        <div className="flex gap-2">
+          {[1, 2, 3, 4].map((n) => (
+            <ChoiceButton key={n} active={numPlayers === n} onClick={() => setNumPlayers(n)}>
+              {n}
+            </ChoiceButton>
+          ))}
+        </div>
+      </Section>
+
+      <Section title="詳細設定">
+        <button
+          onClick={() => setShowDetail(true)}
+          className="w-full flex items-center justify-between px-4 py-3"
+          style={{ background: C.panel, border: `1px solid ${C.border}` }}
+        >
+          <span style={{ fontSize: 13, color: C.creamDim }}>{detailSummary}</span>
+          <span style={{ color: C.muted, fontSize: 13 }}>変更 ＞</span>
+        </button>
+      </Section>
+
+      <Section title="終了ラウンド数">
+        <div className="flex items-center gap-3">
+          <button
+            onClick={() => setMaxRounds(Math.max(1, maxRounds - 1))}
+            className="w-11 h-11 flex items-center justify-center font-semibold"
+            style={{ background: C.panel, border: `1px solid ${C.border}`, color: C.cream, fontSize: 18 }}
+          >
+            −
+          </button>
+          <div className="disp flex-1 text-center" style={{ fontSize: 28, color: C.gold }}>
+            {maxRounds}
+          </div>
+          <button
+            onClick={() => setMaxRounds(Math.min(40, maxRounds + 1))}
+            className="w-11 h-11 flex items-center justify-center font-semibold"
+            style={{ background: C.panel, border: `1px solid ${C.border}`, color: C.cream, fontSize: 18 }}
+          >
+            ＋
+          </button>
+          <button onClick={resetRoundsDefault} style={{ color: C.muted, fontSize: 12, whiteSpace: "nowrap" }}>
+            規定値
+          </button>
+        </div>
+      </Section>
+
+      <Section title="プレイヤー名">
+        <div className="flex flex-col gap-2">
+          {playerNames.map((name, i) => (
+            <input
+              key={i}
+              value={name}
+              onChange={(e) => {
+                const next = [...playerNames];
+                next[i] = e.target.value;
+                setPlayerNames(next);
+              }}
+              placeholder={`プレイヤー${i + 1}`}
+              maxLength={12}
+              className="w-full px-3 py-2.5 outline-none"
+              style={{
+                background: C.panel,
+                border: `1px solid ${C.border}`,
+                color: C.cream,
+              }}
+            />
+          ))}
+        </div>
+      </Section>
+
+      <div className="mt-auto flex flex-col gap-3 pt-4">
+        <button
+          onClick={startGame}
+          className="w-full py-3.5 font-semibold"
+          style={{ background: C.red, color: C.cream, fontSize: 16, letterSpacing: "0.02em" }}
+        >
+          ゲーム開始
+        </button>
+        <button
+          onClick={goHistory}
+          className="w-full py-3 font-medium"
+          style={{
+            background: "transparent",
+            border: `1px solid ${C.border}`,
+            color: C.muted,
+            fontSize: 14,
+          }}
+        >
+          履歴を見る{hasHistory ? "" : "（まだありません）"}
+        </button>
+      </div>
+
+      {showDetail && (
+        <Sheet title="詳細設定" onClose={() => setShowDetail(false)}>
+          {gameType === "01" && (
+            <Section title="アウト方式">
+              <div className="flex gap-2">
+                {[
+                  { k: "single", label: "シングルアウト" },
+                  { k: "double", label: "ダブルアウト" },
+                  { k: "master", label: "マスターアウト" },
+                ].map((o) => (
+                  <ChoiceButton key={o.k} active={outMode === o.k} onClick={() => setOutMode(o.k)}>
+                    {o.label}
+                  </ChoiceButton>
+                ))}
+              </div>
+            </Section>
+          )}
+
+          {gameType === "01" && (
+            <Section title="ブル方式">
+              <div className="flex gap-2">
+                {[
+                  { k: "fat", label: "ファットブル" },
+                  { k: "separate", label: "セパレートブル" },
+                ].map((o) => (
+                  <ChoiceButton key={o.k} active={bullMode === o.k} onClick={() => setBullMode(o.k)}>
+                    {o.label}
+                  </ChoiceButton>
+                ))}
+              </div>
+              <div style={{ color: C.muted, fontSize: 11, marginTop: 6, lineHeight: 1.5 }}>
+                {bullMode === "separate"
+                  ? "アウターブル25点／インナーブル50点として区別します（従来通り）。"
+                  : "ブルはどこに当たっても50点・ダブル扱いになります（アワード判定用にS/Dの入力は残ります）。"}
+              </div>
+            </Section>
+          )}
+
+          <Section title="ハンデ">
+            <div className="flex gap-2 mb-3">
+              {[
+                { k: "none", label: "なし" },
+                { k: "auto", label: "オートハンデ" },
+                { k: "manual", label: "マニュアル" },
+              ].map((o) => (
+                <ChoiceButton key={o.k} active={handicapMode === o.k} onClick={() => setHandicapMode(o.k)}>
+                  {o.label}
+                </ChoiceButton>
+              ))}
+            </div>
+
+            {handicapMode === "auto" && (
+              <div>
+                <div
+                  className="px-3 py-2.5 mb-2"
+                  style={{ background: C.panel, border: `1px solid ${C.border}`, fontSize: 12.5, color: C.creamDim }}
+                >
+                  {playerNames.map((n, i) => `${n || `P${i + 1}`}: Rt.${playerRatings[i] ?? 0}`).join(" ／ ")}
+                </div>
+                <button
+                  onClick={() => setShowRating(true)}
+                  className="w-full py-2.5 font-medium"
+                  style={{ background: C.panel2, border: `1px solid ${C.gold}`, color: C.gold, fontSize: 13.5 }}
+                >
+                  レーティングを設定
+                </button>
+              </div>
+            )}
+
+            {handicapMode === "manual" && (
+              <div className="flex flex-col gap-2">
+                <div style={{ color: C.muted, fontSize: 11.5, marginBottom: 2 }}>
+                  {gameType === "01" ? "スタート点数から引く点数" : "開始得点に加えるボーナス"}
+                </div>
+                {playerNames.map((name, i) => (
+                  <div
+                    key={i}
+                    className="flex items-center justify-between px-3 py-2"
+                    style={{ background: C.panel, border: `1px solid ${C.border}` }}
+                  >
+                    <span style={{ fontSize: 13.5, color: C.creamDim }}>{name || `プレイヤー${i + 1}`}</span>
+                    <div className="flex items-center gap-3">
+                      <button
+                        onClick={() => {
+                          const next = [...manualHandicaps];
+                          next[i] = Math.max(0, (next[i] || 0) - 10);
+                          setManualHandicaps(next);
+                        }}
+                        className="w-8 h-8 flex items-center justify-center"
+                        style={{ background: C.panel2, border: `1px solid ${C.border}`, color: C.cream }}
+                      >
+                        −
+                      </button>
+                      <span className="disp" style={{ fontSize: 20, color: C.gold, minWidth: 40, textAlign: "center" }}>
+                        {manualHandicaps[i] ?? 0}
+                      </span>
+                      <button
+                        onClick={() => {
+                          const next = [...manualHandicaps];
+                          next[i] = (next[i] || 0) + 10;
+                          setManualHandicaps(next);
+                        }}
+                        className="w-8 h-8 flex items-center justify-center"
+                        style={{ background: C.panel2, border: `1px solid ${C.border}`, color: C.cream }}
+                      >
+                        ＋
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </Section>
+
+          <button
+            onClick={() => setShowDetail(false)}
+            className="w-full py-3 font-semibold mt-1"
+            style={{ background: C.red, color: C.cream, fontSize: 15 }}
+          >
+            完了
+          </button>
+        </Sheet>
+      )}
+
+      {showRating && (
+        <Sheet title="オートハンデ設定" onClose={() => setShowRating(false)}>
+          <div style={{ color: C.muted, fontSize: 12, marginBottom: 14, lineHeight: 1.6 }}>
+            各プレイヤーのダーツライブレーティング（0〜18）を入力してください。最もレーティングが高い人が基準になり、他の人は差に応じて自動でハンデが付きます（0は未設定として扱われます）。
+          </div>
+
+          <div className="flex flex-col gap-2 mb-5">
+            {playerNames.map((name, i) => (
+              <div
+                key={i}
+                className="flex items-center justify-between px-3 py-2.5"
+                style={{ background: C.panel, border: `1px solid ${C.border}` }}
+              >
+                <span style={{ fontSize: 13.5, color: C.creamDim }}>{name || `プレイヤー${i + 1}`}</span>
+                <div className="flex items-center gap-3">
+                  <button
+                    onClick={() => {
+                      const next = [...playerRatings];
+                      next[i] = Math.max(0, (next[i] || 0) - 1);
+                      setPlayerRatings(next);
+                    }}
+                    className="w-8 h-8 flex items-center justify-center"
+                    style={{ background: C.panel2, border: `1px solid ${C.border}`, color: C.cream }}
+                  >
+                    −
+                  </button>
+                  <span className="disp" style={{ fontSize: 20, color: C.gold, minWidth: 24, textAlign: "center" }}>
+                    {playerRatings[i] ?? 0}
+                  </span>
+                  <button
+                    onClick={() => {
+                      const next = [...playerRatings];
+                      next[i] = Math.min(18, (next[i] || 0) + 1);
+                      setPlayerRatings(next);
+                    }}
+                    className="w-8 h-8 flex items-center justify-center"
+                    style={{ background: C.panel2, border: `1px solid ${C.border}`, color: C.cream }}
+                  >
+                    ＋
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+
+          <div style={{ color: C.muted, fontSize: 12.5, marginBottom: 8 }}>この設定でのゲーム開始状態</div>
+          <div className="flex flex-col gap-2 mb-5">
+            {playerNames.map((name, i) => {
+              const maxR = Math.max(...playerRatings, 0);
+              const diff = maxR - (playerRatings[i] || 0);
+              const label = name || `プレイヤー${i + 1}`;
+              if (gameType === "01") {
+                const start = auto01Start(diff, variant);
+                return (
+                  <div key={i} className="px-3 py-2.5" style={{ background: C.panel2, border: `1px solid ${C.border}` }}>
+                    <div style={{ fontSize: 12.5, color: C.creamDim, marginBottom: 2 }}>
+                      {label}（Rt.{playerRatings[i] ?? 0}）
+                    </div>
+                    <div className="disp" style={{ fontSize: 22, color: diff === 0 ? C.creamDim : C.gold }}>
+                      {start} スタート
+                    </div>
+                    {diff === 0 && <div style={{ fontSize: 11, color: C.muted }}>ハンデなし</div>}
+                  </div>
+                );
+              }
+              const hc = autoCricketHandicap(diff);
+              const markText = ["18", "17", "16", "15"]
+                .filter((t) => hc.marks[t])
+                .map((t) => `${t}番 ${hc.marks[t]}マーク`)
+                .join(" ／ ");
+              return (
+                <div key={i} className="px-3 py-2.5" style={{ background: C.panel2, border: `1px solid ${C.border}` }}>
+                  <div style={{ fontSize: 12.5, color: C.creamDim, marginBottom: 2 }}>
+                    {label}（Rt.{playerRatings[i] ?? 0}）
+                  </div>
+                  <div className="disp" style={{ fontSize: 22, color: diff === 0 ? C.creamDim : C.gold }}>
+                    {hc.score}点スタート
+                  </div>
+                  {diff === 0 ? (
+                    <div style={{ fontSize: 11, color: C.muted }}>ハンデなし</div>
+                  ) : (
+                    <div style={{ fontSize: 11, color: C.muted }}>先行マーク: {markText}</div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+
+          <button
+            onClick={() => setShowRating(false)}
+            className="w-full py-3 font-semibold"
+            style={{ background: C.red, color: C.cream, fontSize: 15 }}
+          >
+            完了
+          </button>
+        </Sheet>
+      )}
+    </div>
+  );
+}
+
+function Sheet({ title, onClose, children }) {
+  return (
+    <div
+      className="fixed inset-0 flex items-end justify-center"
+      style={{ background: "rgba(0,0,0,0.6)", zIndex: 50 }}
+      onClick={onClose}
+    >
+      <div
+        className="w-full max-w-md flex flex-col"
+        style={{
+          background: C.bg,
+          border: `1px solid ${C.border}`,
+          borderBottom: "none",
+          maxHeight: "85vh",
+          overflowY: "auto",
+          padding: "20px 20px calc(20px + env(safe-area-inset-bottom))",
+        }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between mb-5">
+          <div className="disp" style={{ fontSize: 22, color: C.cream }}>
+            {title}
+          </div>
+          <button onClick={onClose} style={{ color: C.muted, fontSize: 20, lineHeight: 1 }}>
+            ×
+          </button>
+        </div>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+function Section({ title, children }) {
+  return (
+    <div className="mb-5 sm:mb-6">
+      <div style={{ color: C.muted, fontSize: 12.5, marginBottom: 8 }}>{title}</div>
+      {children}
+    </div>
+  );
+}
+
+function ChoiceButton({ active, onClick, children }) {
+  return (
+    <button
+      onClick={onClick}
+      className="flex-1 py-2.5 font-medium transition-colors"
+      style={{
+        background: active ? C.gold : C.panel,
+        color: active ? "#1A1508" : C.creamDim,
+        border: `1px solid ${active ? C.gold : C.border}`,
+        fontSize: 14.5,
+      }}
+    >
+      {children}
+    </button>
+  );
+}
+
+// ============================ SHARED GAME BITS ============================
+function MultiplierBar({ multiplier, setMultiplier }) {
+  const opts = [
+    { v: 1, label: "シングル", color: C.creamDim },
+    { v: 2, label: "ダブル", color: C.gold },
+    { v: 3, label: "トリプル", color: C.red },
+  ];
+  return (
+    <div className="flex gap-2 mb-2.5">
+      {opts.map((o) => {
+        const active = multiplier === o.v;
+        return (
+          <button
+            key={o.v}
+            onClick={() => setMultiplier(o.v)}
+            className="flex-1 py-3 font-semibold"
+            style={{
+              background: active ? o.color : C.panel,
+              color: active ? "#161311" : C.muted,
+              border: `1.5px solid ${active ? o.color : C.border}`,
+              fontSize: 13.5,
+            }}
+          >
+            {o.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function TurnDartsRow({ turnDarts }) {
+  const slots = [0, 1, 2].map((i) => turnDarts[i]?.label || "—");
+  return (
+    <div className="flex gap-2 mb-3">
+      {slots.map((s, i) => (
+        <div
+          key={i}
+          className="flex-1 text-center py-2"
+          style={{
+            background: C.panel2,
+            border: `1px solid ${C.border}`,
+            color: s === "—" ? C.muted : C.cream,
+            fontSize: 14,
+            fontWeight: 600,
+          }}
+        >
+          {s}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function TopBar({ title, round, maxRounds, onUndo, canUndo, onExit }) {
+  return (
+    <div className="flex items-center justify-between px-5 pt-4 sm:pt-5 pb-3 gap-2">
+      <button onClick={onExit} style={{ color: C.muted, fontSize: 13, flexShrink: 0 }}>
+        ← 設定
+      </button>
+      <div style={{ color: C.creamDim, fontSize: 12.5, textAlign: "center" }}>
+        {title} ・ ラウンド {round} / {maxRounds}
+      </div>
+      <button
+        onClick={onUndo}
+        disabled={!canUndo}
+        style={{ color: canUndo ? C.gold : C.border, fontSize: 13, flexShrink: 0 }}
+      >
+        取り消す
+      </button>
+    </div>
+  );
+}
+
+function Toast({ message }) {
+  if (!message) return null;
+  return (
+    <div className="px-5 mb-2">
+      <div
+        className="text-center py-2 font-semibold"
+        style={{ background: C.gold, color: "#1A1508", fontSize: 14 }}
+      >
+        {message}
+      </div>
+    </div>
+  );
+}
+
+function AwardBanner({ awardMsg }) {
+  if (!awardMsg) return null;
+  return (
+    <div className="px-5 mb-2">
+      <div
+        className="text-center py-3"
+        style={{
+          background: `linear-gradient(90deg, ${C.red}, ${C.gold})`,
+          color: "#1A1508",
+        }}
+      >
+        <div style={{ fontSize: 10.5, fontWeight: 600, opacity: 0.75 }}>AWARD</div>
+        <div className="disp" style={{ fontSize: 24, lineHeight: 1.1 }}>
+          {awardMsg}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ================================ 01 SCREEN ================================
+const OUT_MODE_LABEL = { single: "シングルアウト", double: "ダブルアウト", master: "マスターアウト" };
+
+function Game01Screen({
+  players, variant, currentIdx, turnDarts, multiplier, setMultiplier, round, maxRounds,
+  outMode, bullMode, message, awardMsg, onThrow, onUndo, canUndo, onExit,
+}) {
+  return (
+    <div className="flex-1 flex flex-col">
+      <TopBar
+        title={`${variant} ・ ${OUT_MODE_LABEL[outMode] || ""} ・ ${bullMode === "separate" ? "セパレートブル" : "ファットブル"}`}
+        round={round}
+        maxRounds={maxRounds}
+        onUndo={onUndo}
+        canUndo={canUndo}
+        onExit={onExit}
+      />
+      <AwardBanner awardMsg={awardMsg} />
+      <Toast message={message} />
+
+      <div className="px-5 flex flex-col gap-2 mb-3">
+        {players.map((p, i) => {
+          const live100 = computeAvg01(p.points, p.dartsThrown);
+          const live80 = p.snapshot80 ? computeAvg01(p.snapshot80.points, p.snapshot80.darts) : live100;
+          const active = i === currentIdx && !p.finished;
+          return (
+            <div
+              key={i}
+              className="flex items-center justify-between px-4 py-3"
+              style={{
+                background: active ? C.panel2 : C.panel,
+                border: `1.5px solid ${active ? C.gold : C.border}`,
+              }}
+            >
+              <div>
+                <div style={{ fontSize: 14, color: active ? C.cream : C.creamDim, fontWeight: 600 }}>
+                  {p.name}
+                </div>
+                <div style={{ fontSize: 11.5, color: C.muted, marginTop: 2 }}>
+                  80%: {live80} ／ 100%: {live100}
+                </div>
+              </div>
+              <div className="disp" style={{ fontSize: 34, color: active ? C.gold : C.creamDim }}>
+                {p.remaining}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      <div className="px-5">
+        <TurnDartsRow turnDarts={turnDarts} />
+        <MultiplierBar multiplier={multiplier} setMultiplier={setMultiplier} />
+      </div>
+
+      <div className="px-5 mt-1">
+        <div className="num-grid grid grid-cols-5 gap-1.5">
+          {NUM_GRID.map((n) => (
+            <NumBtn key={n} onClick={() => onThrow(n)} mult={multiplier}>
+              {n}
+            </NumBtn>
+          ))}
+        </div>
+        <div className="grid grid-cols-2 gap-1.5 mt-1.5">
+          <NumBtn onClick={() => onThrow("B")} mult={multiplier === 3 ? 2 : multiplier} wide>
+            BULL {multiplier === 1 ? "(S)" : "(D)"}
+          </NumBtn>
+          <button
+            onClick={() => onThrow("MISS")}
+            className="py-3 font-medium"
+            style={{ background: C.panel, border: `1px solid ${C.border}`, color: C.muted, fontSize: 13.5 }}
+          >
+            ミス
+          </button>
+        </div>
+      </div>
+      <div className="pb-8" />
+    </div>
+  );
+}
+
+function NumBtn({ children, onClick, mult, wide }) {
+  const color = mult === 3 ? C.red : mult === 2 ? C.gold : C.borderLight;
+  return (
+    <button
+      onClick={onClick}
+      className="py-3 font-semibold"
+      style={{
+        background: C.panel,
+        border: `1.5px solid ${color}`,
+        color: C.cream,
+        fontSize: 14.5,
+        minHeight: 44,
+      }}
+    >
+      {children}
+    </button>
+  );
+}
+
+// ============================ CRICKET SCREEN ===============================
+function GameCricketScreen({
+  players, currentIdx, turnDarts, multiplier, setMultiplier, round, maxRounds,
+  message, awardMsg, onThrow, onUndo, canUndo, onExit,
+}) {
+  const targets = CRICKET_TARGETS;
+  return (
+    <div className="flex-1 flex flex-col">
+      <TopBar title="クリケット" round={round} maxRounds={maxRounds} onUndo={onUndo} canUndo={canUndo} onExit={onExit} />
+      <AwardBanner awardMsg={awardMsg} />
+      <Toast message={message} />
+
+      <div className="px-5 mb-3 overflow-x-auto">
+        <table className="w-full" style={{ borderCollapse: "collapse", minWidth: 260 }}>
+          <thead>
+            <tr>
+              <th style={{ width: 46 }}></th>
+              {players.map((p, i) => (
+                <th
+                  key={i}
+                  style={{
+                    color: i === currentIdx ? C.gold : C.creamDim,
+                    fontSize: 12,
+                    fontWeight: 600,
+                    padding: "0 4px 6px",
+                    textAlign: "center",
+                  }}
+                >
+                  {p.name}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {targets.map((t) => (
+              <tr key={t}>
+                <td
+                  className="disp"
+                  style={{ color: C.muted, fontSize: 18, padding: "5px 0", textAlign: "center" }}
+                >
+                  {targetLabel(t)}
+                </td>
+                {players.map((p, i) => (
+                  <td key={i} style={{ textAlign: "center", padding: "5px 4px" }}>
+                    <MarkGlyph n={p.marks[t] || 0} />
+                  </td>
+                ))}
+              </tr>
+            ))}
+            <tr>
+              <td style={{ color: C.muted, fontSize: 11.5, padding: "8px 0 2px", textAlign: "center" }}>
+                得点
+              </td>
+              {players.map((p, i) => (
+                <td
+                  key={i}
+                  className="disp"
+                  style={{ fontSize: 22, textAlign: "center", color: i === currentIdx ? C.gold : C.cream }}
+                >
+                  {p.points}
+                </td>
+              ))}
+            </tr>
+            <tr>
+              <td style={{ color: C.muted, fontSize: 10.5, padding: "0 0 8px", textAlign: "center" }}>
+                MPR
+              </td>
+              {players.map((p, i) => {
+                const live100 = computeMPR(p.totalMarks || 0, p.dartsThrown);
+                const live80 = p.snapshot80 ? computeMPR(p.snapshot80.marks, p.snapshot80.darts) : live100;
+                return (
+                  <td key={i} style={{ textAlign: "center", color: C.muted, fontSize: 10 }}>
+                    80% {live80} / 100% {live100}
+                  </td>
+                );
+              })}
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div className="px-5">
+        <TurnDartsRow turnDarts={turnDarts} />
+        <MultiplierBar multiplier={multiplier} setMultiplier={setMultiplier} />
+      </div>
+
+      <div className="px-5">
+        <div className="grid grid-cols-4 gap-1.5">
+          {targets.map((t) => {
+            const mult = t === "B" && multiplier === 3 ? 2 : multiplier;
+            return (
+              <NumBtn key={t} onClick={() => onThrow(t)} mult={mult}>
+                {targetLabel(t)}
+              </NumBtn>
+            );
+          })}
+          <button
+            onClick={() => onThrow("MISS")}
+            className="py-3 font-medium"
+            style={{ background: C.panel, border: `1px solid ${C.border}`, color: C.muted, fontSize: 13.5, minHeight: 44 }}
+          >
+            ミス
+          </button>
+        </div>
+      </div>
+      <div className="pb-8" />
+    </div>
+  );
+}
+
+function MarkGlyph({ n }) {
+  const glyph = n === 0 ? "" : n === 1 ? "／" : n === 2 ? "✕" : "⊗";
+  const color = n >= 3 ? C.gold : n === 0 ? C.border : C.creamDim;
+  return (
+    <span className="disp" style={{ fontSize: 20, color }}>
+      {glyph || "·"}
+    </span>
+  );
+}
+
+// ============================== RESULT ====================================
+function ResultScreen({ result, onRematch, onSetup, onHistory }) {
+  const is01 = result.gameType === "01";
+  return (
+    <div className="flex-1 flex flex-col px-5 pt-10 sm:pt-12 pb-8">
+      <div style={{ color: C.muted, fontSize: 13 }}>
+        {is01 ? `ゼロワン ${result.variant}` : "クリケット"} ・ {fmtDate(result.date)}
+      </div>
+      <div className="disp mt-1 mb-6" style={{ fontSize: "clamp(28px,7vw,36px)", color: C.gold }}>
+        {result.winnerName} の勝利
+      </div>
+
+      {result.awards && result.awards.length > 0 && (
+        <div className="mb-6">
+          <div style={{ color: C.muted, fontSize: 12.5, marginBottom: 8 }}>獲得アワード</div>
+          <div className="flex flex-col gap-1.5">
+            {result.awards.map((a, i) => (
+              <div
+                key={i}
+                className="flex items-center justify-between px-3 py-2"
+                style={{ background: C.panel, border: `1px solid ${C.border}` }}
+              >
+                <span style={{ fontSize: 12.5, color: C.muted }}>
+                  R{a.round} ・ {a.player}
+                </span>
+                <span className="disp" style={{ fontSize: 17, color: C.gold }}>
+                  {a.award}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      <div className="flex flex-col gap-3 mb-8">
+        {result.players.map((p, i) => (
+          <div
+            key={i}
+            className="px-4 py-3"
+            style={{
+              background: p.isWinner ? C.panel2 : C.panel,
+              border: `1.5px solid ${p.isWinner ? C.gold : C.border}`,
+            }}
+          >
+            <div style={{ fontSize: 15, fontWeight: 600, color: C.cream, marginBottom: 6 }}>
+              {p.name}
+            </div>
+            {is01 ? (
+              <div className="flex gap-6 flex-wrap">
+                <Stat label="80%スタッツ（平均）" value={p.avg80} />
+                <Stat label="100%スタッツ（平均）" value={p.avg100} />
+              </div>
+            ) : (
+              <div className="flex gap-6 flex-wrap">
+                <Stat label="80%スタッツ（MPR）" value={p.mpr80} />
+                <Stat label="100%スタッツ（MPR）" value={p.mpr100} />
+                <Stat label="得点" value={p.points} />
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+
+      <div className="mt-auto flex flex-col gap-3">
+        <button
+          onClick={onRematch}
+          className="w-full py-3.5 font-semibold"
+          style={{ background: C.red, color: C.cream, fontSize: 16 }}
+        >
+          もう一度プレイ
+        </button>
+        <button
+          onClick={onHistory}
+          className="w-full py-3 font-medium"
+          style={{ background: "transparent", border: `1px solid ${C.border}`, color: C.creamDim, fontSize: 14 }}
+        >
+          履歴を見る
+        </button>
+        <button
+          onClick={onSetup}
+          className="w-full py-3 font-medium"
+          style={{ background: "transparent", border: "none", color: C.muted, fontSize: 13 }}
+        >
+          設定に戻る
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function Stat({ label, value }) {
+  return (
+    <div>
+      <div style={{ fontSize: 10.5, color: C.muted, marginBottom: 2 }}>{label}</div>
+      <div className="disp" style={{ fontSize: 24, color: C.cream }}>
+        {value}
+      </div>
+    </div>
+  );
+}
+
+// ============================== HISTORY ====================================
+function HistoryScreen({ history, onBack, onDelete, onClear }) {
+  return (
+    <div className="flex-1 flex flex-col px-5 pt-8 pb-8">
+      <div className="flex items-center justify-between mb-6">
+        <button onClick={onBack} style={{ color: C.muted, fontSize: 13 }}>
+          ← 設定
+        </button>
+        <div className="disp" style={{ fontSize: 24, color: C.cream }}>
+          履歴
+        </div>
+        <button
+          onClick={onClear}
+          disabled={history.length === 0}
+          style={{ color: history.length ? C.red : C.border, fontSize: 12.5 }}
+        >
+          全て削除
+        </button>
+      </div>
+
+      {history.length === 0 ? (
+        <div className="flex-1 flex items-center justify-center text-center" style={{ color: C.muted, fontSize: 14 }}>
+          まだ記録がありません
+        </div>
+      ) : (
+        <div className="flex flex-col gap-3 overflow-y-auto">
+          {history.map((r) => (
+            <HistoryCard key={r.id} record={r} onDelete={() => onDelete(r.id)} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function HistoryCard({ record, onDelete }) {
+  const is01 = record.gameType === "01";
+  return (
+    <div className="px-4 py-3" style={{ background: C.panel, border: `1px solid ${C.border}` }}>
+      <div className="flex items-center justify-between mb-2 gap-2">
+        <div style={{ fontSize: 12, color: C.muted }}>
+          {is01 ? `ゼロワン ${record.variant}` : "クリケット"} ・ {fmtDate(record.date)}
+        </div>
+        <button onClick={onDelete} style={{ color: C.muted, fontSize: 11.5, flexShrink: 0 }}>
+          削除
+        </button>
+      </div>
+      <div style={{ fontSize: 14.5, color: C.gold, fontWeight: 600, marginBottom: 6 }}>
+        {record.winnerName} の勝利
+      </div>
+      <div className="flex flex-col gap-1 mb-2">
+        {record.players.map((p, i) => (
+          <div key={i} className="flex justify-between flex-wrap gap-x-2" style={{ fontSize: 12, color: C.creamDim }}>
+            <span>{p.name}</span>
+            {is01 ? (
+              <span>
+                80%: {p.avg80} / 100%: {p.avg100}
+              </span>
+            ) : (
+              <span>
+                MPR 80%: {p.mpr80} / 100%: {p.mpr100} ({p.points}pt)
+              </span>
+            )}
+          </div>
+        ))}
+      </div>
+      {record.awards && record.awards.length > 0 && (
+        <div className="flex flex-col gap-1 pt-2" style={{ borderTop: `1px solid ${C.border}` }}>
+          {record.awards.map((a, i) => (
+            <div key={i} className="flex items-center justify-between" style={{ fontSize: 11 }}>
+              <span style={{ color: C.creamDim }}>{a.player}</span>
+              <span
+                className="disp"
+                style={{
+                  fontSize: 13,
+                  color: C.gold,
+                  border: `1px solid ${C.goldDim}`,
+                  padding: "1px 6px",
+                }}
+              >
+                {a.award}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<DartsScorer />);
+</script>
+</body>
+</html>
