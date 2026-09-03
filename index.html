@@ -4,7 +4,7 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <title>Darts Scorer</title>
-<meta name="description" content="01・クリケット対応のダーツスコアカウンター（シングル/ダブル/マスターアウト、ブル方式、カットスロート、ハンデ、80%/100%スタッツ、履歴、DARTSLIVEアワード対応）" />
+<meta name="description" content="01・クリケット対応のダーツスコアカウンター（シングル/ダブル/マスターアウト、ブル方式、カットスロート、ハンデ、80%/100%スタッツ、履歴、DARTSLIVEアワード、効果音対応）" />
 <link rel="icon" href="data:,">
 <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
@@ -42,6 +42,129 @@
 <script>
 "use strict";
 const { useState, useEffect, useRef } = React;
+// ---- sound engine (Web Audio API, no audio files) ----------------------
+let audioCtx = null;
+function getAudioCtx() {
+    if (typeof window === "undefined")
+        return null;
+    try {
+        if (!audioCtx)
+            audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        if (audioCtx.state === "suspended")
+            audioCtx.resume();
+        return audioCtx;
+    }
+    catch (e) {
+        return null;
+    }
+}
+function sTone(ac, { freq, start, dur, type = "sine", gain = 0.3, freqEnd = null, detune = 0 }) {
+    const osc = ac.createOscillator();
+    const g = ac.createGain();
+    osc.type = type;
+    osc.detune.setValueAtTime(detune, start);
+    osc.frequency.setValueAtTime(freq, start);
+    if (freqEnd !== null)
+        osc.frequency.exponentialRampToValueAtTime(Math.max(freqEnd, 1), start + dur);
+    const peak = gain * 0.7;
+    g.gain.setValueAtTime(0.0001, start);
+    g.gain.exponentialRampToValueAtTime(Math.max(peak, 0.0001), start + Math.min(0.015, dur * 0.25));
+    g.gain.exponentialRampToValueAtTime(0.0001, start + dur);
+    osc.connect(g).connect(ac.destination);
+    osc.start(start);
+    osc.stop(start + dur + 0.02);
+}
+function sNoise(ac, { start, dur, gain = 0.25, lowpass = 1200 }) {
+    const n = Math.floor(ac.sampleRate * dur);
+    const buffer = ac.createBuffer(1, n, ac.sampleRate);
+    const data = buffer.getChannelData(0);
+    for (let i = 0; i < n; i++)
+        data[i] = (Math.random() * 2 - 1) * (1 - i / n);
+    const src = ac.createBufferSource();
+    src.buffer = buffer;
+    const lp = ac.createBiquadFilter();
+    lp.type = "lowpass";
+    lp.frequency.value = lowpass;
+    const g = ac.createGain();
+    g.gain.value = gain * 0.7;
+    src.connect(lp).connect(g).connect(ac.destination);
+    src.start(start);
+}
+const SOUND_FX = {
+    dart: (ac, t) => {
+        sNoise(ac, { start: t, dur: 0.09, gain: 0.35, lowpass: 900 });
+        sTone(ac, { freq: 100, start: t, dur: 0.12, type: "sine", gain: 0.25, freqEnd: 45 });
+    },
+    bust: (ac, t) => {
+        sNoise(ac, { start: t, dur: 0.3, gain: 0.28, lowpass: 500 });
+        sTone(ac, { freq: 90, start: t, dur: 0.3, type: "sawtooth", gain: 0.18, freqEnd: 50 });
+    },
+    checkout: (ac, t) => {
+        sTone(ac, { freq: 440, start: t, dur: 0.08, type: "square", gain: 0.16 });
+        sTone(ac, { freq: 554.37, start: t + 0.09, dur: 0.08, type: "square", gain: 0.16 });
+        sTone(ac, { freq: 659.25, start: t + 0.18, dur: 0.08, type: "square", gain: 0.16 });
+        sTone(ac, { freq: 880, start: t + 0.28, dur: 0.35, type: "triangle", gain: 0.22 });
+    },
+    tap: (ac, t) => {
+        sTone(ac, { freq: 500, start: t, dur: 0.05, type: "sine", gain: 0.14, freqEnd: 650 });
+    },
+    "ONE BULL": (ac, t) => {
+        sTone(ac, { freq: 987.77, start: t, dur: 0.06, type: "sine", gain: 0.16 });
+        sNoise(ac, { start: t, dur: 0.03, gain: 0.14, lowpass: 4000 });
+        sTone(ac, { freq: 1318.5, start: t + 0.05, dur: 0.14, type: "sine", gain: 0.14 });
+    },
+    "LOW TON": (ac, t) => {
+        [523.25, 659.25].forEach((f, i) => sTone(ac, { freq: f, start: t + i * 0.09, dur: 0.22, type: "triangle", gain: 0.2 }));
+    },
+    "HIGH TON": (ac, t) => {
+        [523.25, 659.25, 783.99].forEach((f, i) => sTone(ac, { freq: f, start: t + i * 0.08, dur: 0.25, type: "triangle", gain: 0.22 }));
+    },
+    "HIGH OUT": (ac, t) => {
+        sTone(ac, { freq: 300, start: t, dur: 0.3, type: "sine", gain: 0.18, freqEnd: 900 });
+        sTone(ac, { freq: 1200, start: t + 0.3, dur: 0.3, type: "triangle", gain: 0.22 });
+        sTone(ac, { freq: 1600, start: t + 0.32, dur: 0.28, type: "triangle", gain: 0.16 });
+    },
+    "HAT TRICK": (ac, t) => {
+        sTone(ac, { freq: 784, start: t, dur: 0.09, type: "triangle", gain: 0.18 });
+        sTone(ac, { freq: 784, start: t + 0.12, dur: 0.09, type: "triangle", gain: 0.18 });
+        sTone(ac, { freq: 784, start: t + 0.24, dur: 0.09, type: "triangle", gain: 0.18 });
+        sTone(ac, { freq: 1568, start: t + 0.36, dur: 0.3, type: "sine", gain: 0.18 });
+    },
+    "THREE IN A BED": (ac, t) => {
+        [659.25, 783.99, 987.77].forEach((f, i) => sTone(ac, { freq: f, start: t + i * 0.07, dur: 0.24, type: "triangle", gain: 0.2 }));
+    },
+    "TON 80": (ac, t) => {
+        sTone(ac, { freq: 80, start: t, dur: 0.5, type: "sawtooth", gain: 0.22, freqEnd: 40 });
+        sTone(ac, { freq: 523.25, start: t + 0.1, dur: 0.14, type: "square", gain: 0.18 });
+        sTone(ac, { freq: 659.25, start: t + 0.24, dur: 0.14, type: "square", gain: 0.18 });
+        sTone(ac, { freq: 783.99, start: t + 0.38, dur: 0.14, type: "square", gain: 0.18 });
+        sTone(ac, { freq: 1046.5, start: t + 0.52, dur: 0.45, type: "triangle", gain: 0.26 });
+        sTone(ac, { freq: 1318.5, start: t + 0.55, dur: 0.42, type: "triangle", gain: 0.2 });
+    },
+    "THREE IN THE BLACK": (ac, t) => {
+        sTone(ac, { freq: 65, start: t, dur: 0.6, type: "sine", gain: 0.28 });
+        sTone(ac, { freq: 1567.98, start: t + 0.05, dur: 0.5, type: "sine", gain: 0.1 });
+        sTone(ac, { freq: 1975.53, start: t + 0.15, dur: 0.5, type: "sine", gain: 0.09 });
+        sTone(ac, { freq: 2637, start: t + 0.28, dur: 0.5, type: "sine", gain: 0.08 });
+    },
+    "WHITE HORSE": (ac, t) => {
+        sTone(ac, { freq: 392, start: t, dur: 0.09, type: "triangle", gain: 0.2 });
+        sTone(ac, { freq: 392, start: t + 0.11, dur: 0.09, type: "triangle", gain: 0.2 });
+        sTone(ac, { freq: 587.33, start: t + 0.24, dur: 0.32, type: "triangle", gain: 0.24 });
+    },
+    COUNT: (ac, t) => {
+        [440, 494, 554, 622, 698].forEach((f, i) => sTone(ac, { freq: f, start: t + i * 0.06, dur: 0.12, type: "sine", gain: 0.16 }));
+    },
+};
+function playSound(name) {
+    const ac = getAudioCtx();
+    if (!ac)
+        return;
+    const key = /COUNT$/.test(name) ? "COUNT" : name;
+    const fx = SOUND_FX[key];
+    if (fx)
+        fx(ac, ac.currentTime);
+}
 // ---- palette / tokens -------------------------------------------------
 const C = {
     bg: "#0F1B15",
@@ -468,6 +591,7 @@ function DartsScorer() {
         if (!names.length)
             return;
         flashAward(names.join(" & "));
+        names.forEach((n) => playSound(n));
         setAwardLog((prev) => [
             ...prev,
             ...names.map((a) => { var _a; return ({ player: (_a = players[currentIdx]) === null || _a === void 0 ? void 0 : _a.name, award: a, round }); }),
@@ -476,6 +600,7 @@ function DartsScorer() {
     function throwDart(seg) {
         if (screen !== "game")
             return;
+        playSound("dart");
         pushUndo();
         const newPlayers = deepClone(players);
         const p = newPlayers[currentIdx];
@@ -500,6 +625,7 @@ function DartsScorer() {
                 p.remaining = p.turnStartRemaining;
                 turnEndsNow = true;
                 flash(`${p.name} バースト`);
+                playSound("bust");
             }
             else if (newRemaining === 0 && validFinish) {
                 p.remaining = 0;
@@ -512,6 +638,7 @@ function DartsScorer() {
                 if (p.turnStartRemaining >= 100)
                     highOutFlag = true;
                 flash(`${p.name} チェックアウト！`);
+                playSound("checkout");
             }
             else {
                 p.remaining = newRemaining;
@@ -571,6 +698,7 @@ function DartsScorer() {
                     p.finished = true;
                     justFinished = true;
                     flash(`${p.name} クローズ！`);
+                    playSound("checkout");
                 }
             }
         }
@@ -654,7 +782,10 @@ function SetupScreen({ gameType, setGameType, variant, setVariant, numPlayers, s
         React.createElement("div", { className: "mb-6 sm:mb-8" },
             React.createElement("div", { className: "disp", style: { fontSize: "clamp(30px,8vw,40px)", lineHeight: 1, color: C.cream } }, "Darts Scorer"),
             React.createElement("div", { style: { color: C.muted, fontSize: 13, marginTop: 4 } }, "01\u30FB\u30AF\u30EA\u30B1\u30C3\u30C8\u5BFE\u5FDC \u30B9\u30B3\u30A2\u30AB\u30A6\u30F3\u30BF\u30FC")),
-        React.createElement("button", { onClick: startGame, className: "w-full py-3.5 font-semibold mb-6 sm:mb-8", style: { background: C.red, color: C.cream, fontSize: 16, letterSpacing: "0.02em" } }, "\u30B2\u30FC\u30E0\u958B\u59CB"),
+        React.createElement("button", { onClick: () => {
+                playSound("tap");
+                startGame();
+            }, className: "w-full py-3.5 font-semibold mb-6 sm:mb-8", style: { background: C.red, color: C.cream, fontSize: 16, letterSpacing: "0.02em" } }, "\u30B2\u30FC\u30E0\u958B\u59CB"),
         React.createElement(Section, { title: "\u30B2\u30FC\u30E0\u5F62\u5F0F" },
             React.createElement("div", { className: "flex gap-2" }, [
                 { k: "01", label: "ゼロワン" },
@@ -665,15 +796,27 @@ function SetupScreen({ gameType, setGameType, variant, setVariant, numPlayers, s
         React.createElement(Section, { title: "\u4EBA\u6570" },
             React.createElement("div", { className: "flex gap-2" }, [1, 2, 3, 4].map((n) => (React.createElement(ChoiceButton, { key: n, active: numPlayers === n, onClick: () => setNumPlayers(n) }, n))))),
         React.createElement(Section, { title: "\u8A73\u7D30\u8A2D\u5B9A" },
-            React.createElement("button", { onClick: () => setShowDetail(true), className: "w-full flex items-center justify-between px-4 py-3", style: { background: C.panel, border: `1px solid ${C.border}` } },
+            React.createElement("button", { onClick: () => {
+                    playSound("tap");
+                    setShowDetail(true);
+                }, className: "w-full flex items-center justify-between px-4 py-3", style: { background: C.panel, border: `1px solid ${C.border}` } },
                 React.createElement("span", { style: { fontSize: 13, color: C.creamDim } }, detailSummary),
                 React.createElement("span", { style: { color: C.muted, fontSize: 13 } }, "\u5909\u66F4 \uFF1E"))),
         React.createElement(Section, { title: "\u7D42\u4E86\u30E9\u30A6\u30F3\u30C9\u6570" },
             React.createElement("div", { className: "flex items-center gap-3" },
-                React.createElement("button", { onClick: () => setMaxRounds(Math.max(1, maxRounds - 1)), className: "w-11 h-11 flex items-center justify-center font-semibold", style: { background: C.panel, border: `1px solid ${C.border}`, color: C.cream, fontSize: 18 } }, "\u2212"),
+                React.createElement("button", { onClick: () => {
+                        playSound("tap");
+                        setMaxRounds(Math.max(1, maxRounds - 1));
+                    }, className: "w-11 h-11 flex items-center justify-center font-semibold", style: { background: C.panel, border: `1px solid ${C.border}`, color: C.cream, fontSize: 18 } }, "\u2212"),
                 React.createElement("div", { className: "disp flex-1 text-center", style: { fontSize: 28, color: C.gold } }, maxRounds),
-                React.createElement("button", { onClick: () => setMaxRounds(Math.min(40, maxRounds + 1)), className: "w-11 h-11 flex items-center justify-center font-semibold", style: { background: C.panel, border: `1px solid ${C.border}`, color: C.cream, fontSize: 18 } }, "\uFF0B"),
-                React.createElement("button", { onClick: resetRoundsDefault, style: { color: C.muted, fontSize: 12, whiteSpace: "nowrap" } }, "\u898F\u5B9A\u5024"))),
+                React.createElement("button", { onClick: () => {
+                        playSound("tap");
+                        setMaxRounds(Math.min(40, maxRounds + 1));
+                    }, className: "w-11 h-11 flex items-center justify-center font-semibold", style: { background: C.panel, border: `1px solid ${C.border}`, color: C.cream, fontSize: 18 } }, "\uFF0B"),
+                React.createElement("button", { onClick: () => {
+                        playSound("tap");
+                        resetRoundsDefault();
+                    }, style: { color: C.muted, fontSize: 12, whiteSpace: "nowrap" } }, "\u898F\u5B9A\u5024"))),
         React.createElement(Section, { title: "\u30D7\u30EC\u30A4\u30E4\u30FC\u540D" },
             React.createElement("div", { className: "flex flex-col gap-2" }, playerNames.map((name, i) => (React.createElement("input", { key: i, value: name, onChange: (e) => {
                     const next = [...playerNames];
@@ -685,7 +828,10 @@ function SetupScreen({ gameType, setGameType, variant, setVariant, numPlayers, s
                     color: C.cream,
                 } }))))),
         React.createElement("div", { className: "mt-auto pt-4" },
-            React.createElement("button", { onClick: goHistory, className: "w-full py-3 font-medium", style: {
+            React.createElement("button", { onClick: () => {
+                    playSound("tap");
+                    goHistory();
+                }, className: "w-full py-3 font-medium", style: {
                     background: "transparent",
                     border: `1px solid ${C.border}`,
                     color: C.muted,
@@ -724,7 +870,10 @@ function SetupScreen({ gameType, setGameType, variant, setVariant, numPlayers, s
                 ].map((o) => (React.createElement(ChoiceButton, { key: o.k, active: handicapMode === o.k, onClick: () => setHandicapMode(o.k) }, o.label)))),
                 handicapMode === "auto" && (React.createElement("div", null,
                     React.createElement("div", { className: "px-3 py-2.5 mb-2", style: { background: C.panel, border: `1px solid ${C.border}`, fontSize: 12.5, color: C.creamDim } }, playerNames.map((n, i) => { var _a; return `${n || `P${i + 1}`}: Rt.${(_a = playerRatings[i]) !== null && _a !== void 0 ? _a : 0}`; }).join(" ／ ")),
-                    React.createElement("button", { onClick: () => setShowRating(true), className: "w-full py-2.5 font-medium", style: { background: C.panel2, border: `1px solid ${C.gold}`, color: C.gold, fontSize: 13.5 } }, "\u30EC\u30FC\u30C6\u30A3\u30F3\u30B0\u3092\u8A2D\u5B9A"))),
+                    React.createElement("button", { onClick: () => {
+                            playSound("tap");
+                            setShowRating(true);
+                        }, className: "w-full py-2.5 font-medium", style: { background: C.panel2, border: `1px solid ${C.gold}`, color: C.gold, fontSize: 13.5 } }, "\u30EC\u30FC\u30C6\u30A3\u30F3\u30B0\u3092\u8A2D\u5B9A"))),
                 handicapMode === "manual" && (React.createElement("div", { className: "flex flex-col gap-2" },
                     React.createElement("div", { style: { color: C.muted, fontSize: 11.5, marginBottom: 2 } }, gameType === "01" ? "スタート点数から引く点数" : "開始得点に加えるボーナス"),
                     playerNames.map((name, i) => {
@@ -733,18 +882,23 @@ function SetupScreen({ gameType, setGameType, variant, setVariant, numPlayers, s
                             React.createElement("span", { style: { fontSize: 13.5, color: C.creamDim } }, name || `プレイヤー${i + 1}`),
                             React.createElement("div", { className: "flex items-center gap-3" },
                                 React.createElement("button", { onClick: () => {
+                                        playSound("tap");
                                         const next = [...manualHandicaps];
                                         next[i] = Math.max(0, (next[i] || 0) - 10);
                                         setManualHandicaps(next);
                                     }, className: "w-8 h-8 flex items-center justify-center", style: { background: C.panel2, border: `1px solid ${C.border}`, color: C.cream } }, "\u2212"),
                                 React.createElement("span", { className: "disp", style: { fontSize: 20, color: C.gold, minWidth: 40, textAlign: "center" } }, (_a = manualHandicaps[i]) !== null && _a !== void 0 ? _a : 0),
                                 React.createElement("button", { onClick: () => {
+                                        playSound("tap");
                                         const next = [...manualHandicaps];
                                         next[i] = (next[i] || 0) + 10;
                                         setManualHandicaps(next);
                                     }, className: "w-8 h-8 flex items-center justify-center", style: { background: C.panel2, border: `1px solid ${C.border}`, color: C.cream } }, "\uFF0B"))));
                     })))),
-            React.createElement("button", { onClick: () => setShowDetail(false), className: "w-full py-3 font-semibold mt-1", style: { background: C.red, color: C.cream, fontSize: 15 } }, "\u5B8C\u4E86"))),
+            React.createElement("button", { onClick: () => {
+                    playSound("tap");
+                    setShowDetail(false);
+                }, className: "w-full py-3 font-semibold mt-1", style: { background: C.red, color: C.cream, fontSize: 15 } }, "\u5B8C\u4E86"))),
         showRating && (React.createElement(Sheet, { title: "\u30AA\u30FC\u30C8\u30CF\u30F3\u30C7\u8A2D\u5B9A", onClose: () => setShowRating(false) },
             React.createElement("div", { style: { color: C.muted, fontSize: 12, marginBottom: 14, lineHeight: 1.6 } }, "\u5404\u30D7\u30EC\u30A4\u30E4\u30FC\u306E\u30C0\u30FC\u30C4\u30E9\u30A4\u30D6\u30EC\u30FC\u30C6\u30A3\u30F3\u30B0\uFF080\u301C18\uFF09\u3092\u5165\u529B\u3057\u3066\u304F\u3060\u3055\u3044\u3002\u6700\u3082\u30EC\u30FC\u30C6\u30A3\u30F3\u30B0\u304C\u9AD8\u3044\u4EBA\u304C\u57FA\u6E96\u306B\u306A\u308A\u3001\u4ED6\u306E\u4EBA\u306F\u5DEE\u306B\u5FDC\u3058\u3066\u81EA\u52D5\u3067\u30CF\u30F3\u30C7\u304C\u4ED8\u304D\u307E\u3059\uFF080\u306F\u672A\u8A2D\u5B9A\u3068\u3057\u3066\u6271\u308F\u308C\u307E\u3059\uFF09\u3002"),
             React.createElement("div", { className: "flex flex-col gap-2 mb-5" }, playerNames.map((name, i) => {
@@ -753,12 +907,14 @@ function SetupScreen({ gameType, setGameType, variant, setVariant, numPlayers, s
                     React.createElement("span", { style: { fontSize: 13.5, color: C.creamDim } }, name || `プレイヤー${i + 1}`),
                     React.createElement("div", { className: "flex items-center gap-3" },
                         React.createElement("button", { onClick: () => {
+                                playSound("tap");
                                 const next = [...playerRatings];
                                 next[i] = Math.max(0, (next[i] || 0) - 1);
                                 setPlayerRatings(next);
                             }, className: "w-8 h-8 flex items-center justify-center", style: { background: C.panel2, border: `1px solid ${C.border}`, color: C.cream } }, "\u2212"),
                         React.createElement("span", { className: "disp", style: { fontSize: 20, color: C.gold, minWidth: 24, textAlign: "center" } }, (_a = playerRatings[i]) !== null && _a !== void 0 ? _a : 0),
                         React.createElement("button", { onClick: () => {
+                                playSound("tap");
                                 const next = [...playerRatings];
                                 next[i] = Math.min(18, (next[i] || 0) + 1);
                                 setPlayerRatings(next);
@@ -799,7 +955,10 @@ function SetupScreen({ gameType, setGameType, variant, setVariant, numPlayers, s
                         "\u5148\u884C\u30DE\u30FC\u30AF: ",
                         markText))));
             })),
-            React.createElement("button", { onClick: () => setShowRating(false), className: "w-full py-3 font-semibold", style: { background: C.red, color: C.cream, fontSize: 15 } }, "\u5B8C\u4E86")))));
+            React.createElement("button", { onClick: () => {
+                    playSound("tap");
+                    setShowRating(false);
+                }, className: "w-full py-3 font-semibold", style: { background: C.red, color: C.cream, fontSize: 15 } }, "\u5B8C\u4E86")))));
 }
 function Sheet({ title, onClose, children }) {
     return (React.createElement("div", { className: "fixed inset-0 flex items-end justify-center", style: { background: "rgba(0,0,0,0.6)", zIndex: 50 }, onClick: onClose },
@@ -813,7 +972,10 @@ function Sheet({ title, onClose, children }) {
             }, onClick: (e) => e.stopPropagation() },
             React.createElement("div", { className: "flex items-center justify-between mb-5" },
                 React.createElement("div", { className: "disp", style: { fontSize: 22, color: C.cream } }, title),
-                React.createElement("button", { onClick: onClose, style: { color: C.muted, fontSize: 20, lineHeight: 1 } }, "\u00D7")),
+                React.createElement("button", { onClick: () => {
+                        playSound("tap");
+                        onClose();
+                    }, style: { color: C.muted, fontSize: 20, lineHeight: 1 } }, "\u00D7")),
             children)));
 }
 function Section({ title, children }) {
@@ -822,7 +984,10 @@ function Section({ title, children }) {
         children));
 }
 function ChoiceButton({ active, onClick, children }) {
-    return (React.createElement("button", { onClick: onClick, className: "flex-1 py-2.5 font-medium transition-colors", style: {
+    return (React.createElement("button", { onClick: () => {
+            playSound("tap");
+            onClick();
+        }, className: "flex-1 py-2.5 font-medium transition-colors", style: {
             background: active ? C.gold : C.panel,
             color: active ? "#1A1508" : C.creamDim,
             border: `1px solid ${active ? C.gold : C.border}`,
@@ -838,7 +1003,10 @@ function MultiplierBar({ multiplier, setMultiplier }) {
     ];
     return (React.createElement("div", { className: "flex gap-2 mb-2.5" }, opts.map((o) => {
         const active = multiplier === o.v;
-        return (React.createElement("button", { key: o.v, onClick: () => setMultiplier(o.v), className: "flex-1 py-3 font-semibold", style: {
+        return (React.createElement("button", { key: o.v, onClick: () => {
+                playSound("tap");
+                setMultiplier(o.v);
+            }, className: "flex-1 py-3 font-semibold", style: {
                 background: active ? o.color : C.panel,
                 color: active ? "#161311" : C.muted,
                 border: `1.5px solid ${active ? o.color : C.border}`,
@@ -858,14 +1026,20 @@ function TurnDartsRow({ turnDarts }) {
 }
 function TopBar({ title, round, maxRounds, onUndo, canUndo, onExit }) {
     return (React.createElement("div", { className: "flex items-center justify-between px-5 pt-4 sm:pt-5 pb-3 gap-2" },
-        React.createElement("button", { onClick: onExit, style: { color: C.muted, fontSize: 13, flexShrink: 0 } }, "\u2190 \u8A2D\u5B9A"),
+        React.createElement("button", { onClick: () => {
+                playSound("tap");
+                onExit();
+            }, style: { color: C.muted, fontSize: 13, flexShrink: 0 } }, "\u2190 \u8A2D\u5B9A"),
         React.createElement("div", { style: { color: C.creamDim, fontSize: 12.5, textAlign: "center" } },
             title,
             " \u30FB \u30E9\u30A6\u30F3\u30C9 ",
             round,
             " / ",
             maxRounds),
-        React.createElement("button", { onClick: onUndo, disabled: !canUndo, style: { color: canUndo ? C.gold : C.border, fontSize: 13, flexShrink: 0 } }, "\u53D6\u308A\u6D88\u3059")));
+        React.createElement("button", { onClick: () => {
+                playSound("tap");
+                onUndo();
+            }, disabled: !canUndo, style: { color: canUndo ? C.gold : C.border, fontSize: 13, flexShrink: 0 } }, "\u53D6\u308A\u6D88\u3059")));
 }
 function Toast({ message }) {
     if (!message)
@@ -1019,9 +1193,18 @@ function ResultScreen({ result, onRematch, onSetup, onHistory }) {
                 React.createElement(Stat, { label: "100%\u30B9\u30BF\u30C3\u30C4\uFF08MPR\uFF09", value: p.mpr100 }),
                 React.createElement(Stat, { label: result.cutThroat ? "得点（低い方が有利）" : "得点", value: p.points }))))))),
         React.createElement("div", { className: "mt-auto flex flex-col gap-3" },
-            React.createElement("button", { onClick: onRematch, className: "w-full py-3.5 font-semibold", style: { background: C.red, color: C.cream, fontSize: 16 } }, "\u3082\u3046\u4E00\u5EA6\u30D7\u30EC\u30A4"),
-            React.createElement("button", { onClick: onHistory, className: "w-full py-3 font-medium", style: { background: "transparent", border: `1px solid ${C.border}`, color: C.creamDim, fontSize: 14 } }, "\u5C65\u6B74\u3092\u898B\u308B"),
-            React.createElement("button", { onClick: onSetup, className: "w-full py-3 font-medium", style: { background: "transparent", border: "none", color: C.muted, fontSize: 13 } }, "\u8A2D\u5B9A\u306B\u623B\u308B"))));
+            React.createElement("button", { onClick: () => {
+                    playSound("tap");
+                    onRematch();
+                }, className: "w-full py-3.5 font-semibold", style: { background: C.red, color: C.cream, fontSize: 16 } }, "\u3082\u3046\u4E00\u5EA6\u30D7\u30EC\u30A4"),
+            React.createElement("button", { onClick: () => {
+                    playSound("tap");
+                    onHistory();
+                }, className: "w-full py-3 font-medium", style: { background: "transparent", border: `1px solid ${C.border}`, color: C.creamDim, fontSize: 14 } }, "\u5C65\u6B74\u3092\u898B\u308B"),
+            React.createElement("button", { onClick: () => {
+                    playSound("tap");
+                    onSetup();
+                }, className: "w-full py-3 font-medium", style: { background: "transparent", border: "none", color: C.muted, fontSize: 13 } }, "\u8A2D\u5B9A\u306B\u623B\u308B"))));
 }
 function Stat({ label, value }) {
     return (React.createElement("div", null,
@@ -1032,9 +1215,15 @@ function Stat({ label, value }) {
 function HistoryScreen({ history, onBack, onDelete, onClear }) {
     return (React.createElement("div", { className: "flex-1 flex flex-col px-5 pt-8 pb-8" },
         React.createElement("div", { className: "flex items-center justify-between mb-6" },
-            React.createElement("button", { onClick: onBack, style: { color: C.muted, fontSize: 13 } }, "\u2190 \u8A2D\u5B9A"),
+            React.createElement("button", { onClick: () => {
+                    playSound("tap");
+                    onBack();
+                }, style: { color: C.muted, fontSize: 13 } }, "\u2190 \u8A2D\u5B9A"),
             React.createElement("div", { className: "disp", style: { fontSize: 24, color: C.cream } }, "\u5C65\u6B74"),
-            React.createElement("button", { onClick: onClear, disabled: history.length === 0, style: { color: history.length ? C.red : C.border, fontSize: 12.5 } }, "\u5168\u3066\u524A\u9664")),
+            React.createElement("button", { onClick: () => {
+                    playSound("tap");
+                    onClear();
+                }, disabled: history.length === 0, style: { color: history.length ? C.red : C.border, fontSize: 12.5 } }, "\u5168\u3066\u524A\u9664")),
         history.length === 0 ? (React.createElement("div", { className: "flex-1 flex items-center justify-center text-center", style: { color: C.muted, fontSize: 14 } }, "\u307E\u3060\u8A18\u9332\u304C\u3042\u308A\u307E\u305B\u3093")) : (React.createElement("div", { className: "flex flex-col gap-3 overflow-y-auto" }, history.map((r) => (React.createElement(HistoryCard, { key: r.id, record: r, onDelete: () => onDelete(r.id) })))))));
 }
 function HistoryCard({ record, onDelete }) {
@@ -1045,7 +1234,10 @@ function HistoryCard({ record, onDelete }) {
                 is01 ? `ゼロワン ${record.variant}` : `クリケット${record.cutThroat ? " ・ カットスロート" : ""}`,
                 " \u30FB ",
                 fmtDate(record.date)),
-            React.createElement("button", { onClick: onDelete, style: { color: C.muted, fontSize: 11.5, flexShrink: 0 } }, "\u524A\u9664")),
+            React.createElement("button", { onClick: () => {
+                    playSound("tap");
+                    onDelete();
+                }, style: { color: C.muted, fontSize: 11.5, flexShrink: 0 } }, "\u524A\u9664")),
         React.createElement("div", { style: { fontSize: 14.5, color: C.gold, fontWeight: 600, marginBottom: 6 } },
             record.winnerName,
             " \u306E\u52DD\u5229"),
