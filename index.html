@@ -4,7 +4,7 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <title>Darts Scorer</title>
-<meta name="description" content="01・クリケット対応のダーツスコアカウンター（シングル/ダブル/マスターアウト、ブル方式、カットスロート、ハンデ、80%/100%スタッツ、履歴、DARTSLIVEアワード、効果音対応）" />
+<meta name="description" content="01・クリケット・カウントアップ対応のダーツスコアカウンター（シングル/ダブル/マスターアウト、ブル方式、カットスロート、ハンデ、80%/100%スタッツ、履歴、DARTSLIVEアワード、効果音対応）" />
 <link rel="icon" href="data:,">
 <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
@@ -219,6 +219,8 @@ function fmtDate(iso) {
 function defaultMaxRounds(gameType, variant) {
     if (gameType === "01")
         return variant >= 901 ? 20 : 15;
+    if (gameType === "countup")
+        return 8;
     return 20; // Standard Cricket
 }
 // ---- DARTSLIVE2 AUTO HANDICAP tables (official, integer rating gaps) ----
@@ -467,7 +469,7 @@ function DartsScorer() {
                 };
             });
         }
-        else {
+        else if (gameType === "cricket") {
             np = names.map((name, i) => {
                 const marks = {};
                 CRICKET_TARGETS.forEach((t) => (marks[t] = 0));
@@ -491,6 +493,16 @@ function DartsScorer() {
                     finished: false,
                 };
             });
+        }
+        else {
+            // countup
+            np = names.map((name) => ({
+                name,
+                points: 0,
+                dartsThrown: 0,
+                snapshot80: null,
+                finished: false,
+            }));
         }
         setPlayers(np);
         setCurrentIdx(0);
@@ -545,7 +557,7 @@ function DartsScorer() {
                 };
             });
         }
-        else {
+        else if (gameType === "cricket") {
             resultsPlayers = finalPlayers.map((p) => {
                 const s80 = p.snapshot80 || { marks: p.totalMarks, darts: p.dartsThrown };
                 return {
@@ -557,11 +569,24 @@ function DartsScorer() {
                 };
             });
         }
+        else {
+            resultsPlayers = finalPlayers.map((p) => {
+                const s80 = p.snapshot80 || { points: p.points, darts: p.dartsThrown };
+                return {
+                    name: p.name,
+                    avg80: computeAvg01(s80.points, s80.darts),
+                    avg100: computeAvg01(p.points, p.dartsThrown),
+                    totalPoints: p.points,
+                    isWinner: winners.includes(p.name),
+                };
+            });
+        }
         const record = {
             id: Date.now(),
             date: new Date().toISOString(),
             gameType,
             variant: gameType === "01" ? variant : null,
+            maxRounds,
             cutThroat: gameType === "cricket" ? cutThroat : false,
             winnerName: winners.length > 1 ? `${winners.join(" / ")}（引き分け）` : winners[0],
             players: resultsPlayers,
@@ -577,7 +602,7 @@ function DartsScorer() {
             const minRem = Math.min(...newPlayers.map((p) => p.remaining));
             winners = newPlayers.filter((p) => p.remaining === minRem).map((p) => p.name);
         }
-        else if (cutThroat) {
+        else if (gameType === "cricket" && cutThroat) {
             const minPts = Math.min(...newPlayers.map((p) => p.points));
             winners = newPlayers.filter((p) => p.points === minPts).map((p) => p.name);
         }
@@ -585,6 +610,7 @@ function DartsScorer() {
             const maxPts = Math.max(...newPlayers.map((p) => p.points));
             winners = newPlayers.filter((p) => p.points === maxPts).map((p) => p.name);
         }
+        playSound("checkout");
         finalizeGame(newPlayers, winners);
     }
     function recordAwards(names) {
@@ -609,7 +635,7 @@ function DartsScorer() {
                 p.turnStartRemaining = p.remaining;
         }
         const rawMult = seg === "B" ? Math.min(multiplier, 2) : multiplier;
-        const scoreMult = gameType === "01" && seg === "B" && bullMode === "fat" ? 2 : rawMult;
+        const scoreMult = (gameType === "01" || gameType === "countup") && seg === "B" && bullMode === "fat" ? 2 : rawMult;
         const label = segLabel(seg, rawMult);
         let turnEndsNow = false;
         let justFinished = false;
@@ -648,7 +674,7 @@ function DartsScorer() {
                 }
             }
         }
-        else {
+        else if (gameType === "cricket") {
             p.dartsThrown += 1;
             if (seg !== "MISS") {
                 const hits = rawMult;
@@ -701,6 +727,23 @@ function DartsScorer() {
                     playSound("checkout");
                 }
             }
+        }
+        else {
+            // countup: no bust, no checkout — just accumulate points over a fixed number of rounds
+            const value = seg === "MISS" ? 0 : seg === "B" ? (scoreMult === 2 ? 50 : 25) : seg * scoreMult;
+            dartValue = value;
+            p.dartsThrown += 1;
+            p.points += value;
+            let justReached80 = false;
+            if (!reached80 && round >= Math.ceil(maxRounds * 0.8)) {
+                newPlayers.forEach((pl) => {
+                    if (!pl.snapshot80)
+                        pl.snapshot80 = { points: pl.points, darts: pl.dartsThrown };
+                });
+                justReached80 = true;
+            }
+            if (justReached80)
+                setReached80(true);
         }
         setPlayers(newPlayers);
         const newTurnDarts = [...turnDarts, { label, seg, mult: rawMult, value: dartValue }];
@@ -766,6 +809,7 @@ function DartsScorer() {
                 }, startGame: startGame, goHistory: () => setScreen("history"), hasHistory: history.length > 0 })),
             screen === "game" && gameType === "01" && (React.createElement(Game01Screen, { players: players, variant: variant, currentIdx: currentIdx, turnDarts: turnDarts, multiplier: multiplier, setMultiplier: setMultiplier, round: round, maxRounds: maxRounds, outMode: outMode, bullMode: bullMode, message: message, awardMsg: awardMsg, onThrow: throwDart, onUndo: undo, canUndo: undoStack.length > 0, onExit: backToSetup })),
             screen === "game" && gameType === "cricket" && (React.createElement(GameCricketScreen, { players: players, cutThroat: cutThroat, currentIdx: currentIdx, turnDarts: turnDarts, multiplier: multiplier, setMultiplier: setMultiplier, round: round, maxRounds: maxRounds, message: message, awardMsg: awardMsg, onThrow: throwDart, onUndo: undo, canUndo: undoStack.length > 0, onExit: backToSetup })),
+            screen === "game" && gameType === "countup" && (React.createElement(CountUpScreen, { players: players, bullMode: bullMode, currentIdx: currentIdx, turnDarts: turnDarts, multiplier: multiplier, setMultiplier: setMultiplier, round: round, maxRounds: maxRounds, message: message, awardMsg: awardMsg, onThrow: throwDart, onUndo: undo, canUndo: undoStack.length > 0, onExit: backToSetup })),
             screen === "result" && result && (React.createElement(ResultScreen, { result: result, onRematch: startGame, onSetup: () => setScreen("setup"), onHistory: () => setScreen("history") })),
             screen === "history" && (React.createElement(HistoryScreen, { history: history, onBack: () => setScreen("setup"), onDelete: deleteHistoryItem, onClear: clearHistory })))));
 }
@@ -777,11 +821,13 @@ function SetupScreen({ gameType, setGameType, variant, setVariant, numPlayers, s
     const bullSummary = bullMode === "separate" ? "セパレートブル" : "ファットブル";
     const detailSummary = gameType === "01"
         ? `${OUT_MODE_LABEL[outMode]} ・ ${bullSummary} ・ ハンデ: ${handicapSummary}`
-        : `${cutThroat ? "カットスロート ・ " : ""}ハンデ: ${handicapSummary}`;
+        : gameType === "countup"
+            ? bullSummary
+            : `${cutThroat ? "カットスロート ・ " : ""}ハンデ: ${handicapSummary}`;
     return (React.createElement("div", { className: "flex-1 flex flex-col px-5 pt-8 sm:pt-10 pb-8" },
         React.createElement("div", { className: "mb-6 sm:mb-8" },
             React.createElement("div", { className: "disp", style: { fontSize: "clamp(30px,8vw,40px)", lineHeight: 1, color: C.cream } }, "Darts Scorer"),
-            React.createElement("div", { style: { color: C.muted, fontSize: 13, marginTop: 4 } }, "01\u30FB\u30AF\u30EA\u30B1\u30C3\u30C8\u5BFE\u5FDC \u30B9\u30B3\u30A2\u30AB\u30A6\u30F3\u30BF\u30FC")),
+            React.createElement("div", { style: { color: C.muted, fontSize: 13, marginTop: 4 } }, "01\u30FB\u30AF\u30EA\u30B1\u30C3\u30C8\u30FB\u30AB\u30A6\u30F3\u30C8\u30A2\u30C3\u30D7\u5BFE\u5FDC \u30B9\u30B3\u30A2\u30AB\u30A6\u30F3\u30BF\u30FC")),
         React.createElement("button", { onClick: () => {
                 playSound("tap");
                 startGame();
@@ -790,6 +836,7 @@ function SetupScreen({ gameType, setGameType, variant, setVariant, numPlayers, s
             React.createElement("div", { className: "flex gap-2" }, [
                 { k: "01", label: "ゼロワン" },
                 { k: "cricket", label: "クリケット" },
+                { k: "countup", label: "カウントアップ" },
             ].map((o) => (React.createElement(ChoiceButton, { key: o.k, active: gameType === o.k, onClick: () => setGameType(o.k) }, o.label))))),
         gameType === "01" && (React.createElement(Section, { title: "\u6301\u3061\u70B9" },
             React.createElement("div", { className: "flex gap-2" }, [301, 501, 701].map((v) => (React.createElement(ChoiceButton, { key: v, active: variant === v, onClick: () => setVariant(v) }, v)))))),
@@ -846,14 +893,16 @@ function SetupScreen({ gameType, setGameType, variant, setVariant, numPlayers, s
                     { k: "double", label: "ダブルアウト" },
                     { k: "master", label: "マスターアウト" },
                 ].map((o) => (React.createElement(ChoiceButton, { key: o.k, active: outMode === o.k, onClick: () => setOutMode(o.k) }, o.label)))))),
-            gameType === "01" && (React.createElement(Section, { title: "\u30D6\u30EB\u65B9\u5F0F" },
+            (gameType === "01" || gameType === "countup") && (React.createElement(Section, { title: "\u30D6\u30EB\u65B9\u5F0F" },
                 React.createElement("div", { className: "flex gap-2" }, [
                     { k: "fat", label: "ファットブル" },
                     { k: "separate", label: "セパレートブル" },
                 ].map((o) => (React.createElement(ChoiceButton, { key: o.k, active: bullMode === o.k, onClick: () => setBullMode(o.k) }, o.label)))),
                 React.createElement("div", { style: { color: C.muted, fontSize: 11, marginTop: 6, lineHeight: 1.5 } }, bullMode === "separate"
                     ? "アウターブル25点／インナーブル50点として区別します。"
-                    : "ブルはどこに当たっても50点・ダブル扱いになります。"))),
+                    : gameType === "01"
+                        ? "ブルはどこに当たっても50点・ダブル扱いになります。"
+                        : "ブルはどこに当たっても50点になります。"))),
             gameType === "cricket" && (React.createElement(Section, { title: "\u30AB\u30C3\u30C8\u30B9\u30ED\u30FC\u30C8" },
                 React.createElement("div", { className: "flex gap-2" }, [
                     { k: false, label: "オフ" },
@@ -862,7 +911,7 @@ function SetupScreen({ gameType, setGameType, variant, setVariant, numPlayers, s
                 React.createElement("div", { style: { color: C.muted, fontSize: 11, marginTop: 6, lineHeight: 1.5 } }, cutThroat
                     ? "オープン済みナンバーに当てると、まだオープンしていない相手に得点が入ります。得点が低い方が有利になります。"
                     : "通常ルールです。オープン済みナンバーに当てると自分に得点が入ります。"))),
-            React.createElement(Section, { title: "\u30CF\u30F3\u30C7" },
+            gameType !== "countup" && (React.createElement(Section, { title: "\u30CF\u30F3\u30C7" },
                 React.createElement("div", { className: "flex gap-2 mb-3" }, [
                     { k: "none", label: "なし" },
                     { k: "auto", label: "オートハンデ" },
@@ -894,7 +943,7 @@ function SetupScreen({ gameType, setGameType, variant, setVariant, numPlayers, s
                                         next[i] = (next[i] || 0) + 10;
                                         setManualHandicaps(next);
                                     }, className: "w-8 h-8 flex items-center justify-center", style: { background: C.panel2, border: `1px solid ${C.border}`, color: C.cream } }, "\uFF0B"))));
-                    })))),
+                    }))))),
             React.createElement("button", { onClick: () => {
                     playSound("tap");
                     setShowDetail(false);
@@ -1094,6 +1143,45 @@ function Game01Screen({ players, variant, currentIdx, turnDarts, multiplier, set
                 React.createElement("button", { onClick: () => onThrow("MISS"), className: "py-3 font-medium", style: { background: C.panel, border: `1px solid ${C.border}`, color: C.muted, fontSize: 13.5 } }, "\u30DF\u30B9"))),
         React.createElement("div", { className: "pb-8" })));
 }
+// ============================== COUNT-UP SCREEN ============================
+function CountUpScreen({ players, bullMode, currentIdx, turnDarts, multiplier, setMultiplier, round, maxRounds, message, awardMsg, onThrow, onUndo, canUndo, onExit, }) {
+    const leadScore = players.length ? Math.max(...players.map((p) => p.points)) : 0;
+    return (React.createElement("div", { className: "flex-1 flex flex-col" },
+        React.createElement(TopBar, { title: `カウントアップ ・ ${bullMode === "separate" ? "セパレートブル" : "ファットブル"}`, round: round, maxRounds: maxRounds, onUndo: onUndo, canUndo: canUndo, onExit: onExit }),
+        React.createElement(AwardBanner, { awardMsg: awardMsg }),
+        React.createElement(Toast, { message: message }),
+        React.createElement("div", { className: "px-5 flex flex-col gap-2 mb-3" }, players.map((p, i) => {
+            const live100 = computeAvg01(p.points, p.dartsThrown);
+            const live80 = p.snapshot80 ? computeAvg01(p.snapshot80.points, p.snapshot80.darts) : live100;
+            const active = i === currentIdx;
+            const leading = players.length > 1 && p.points === leadScore && p.dartsThrown > 0;
+            return (React.createElement("div", { key: i, className: "flex items-center justify-between px-4 py-3", style: {
+                    background: active ? C.panel2 : C.panel,
+                    border: `1.5px solid ${active ? C.gold : C.border}`,
+                } },
+                React.createElement("div", null,
+                    React.createElement("div", { style: { fontSize: 14, color: active ? C.cream : C.creamDim, fontWeight: 600 } },
+                        p.name,
+                        leading ? " ・ 首位" : ""),
+                    React.createElement("div", { style: { fontSize: 11.5, color: C.muted, marginTop: 2 } },
+                        "80%: ",
+                        live80,
+                        " \uFF0F 100%: ",
+                        live100)),
+                React.createElement("div", { className: "disp", style: { fontSize: 34, color: active ? C.gold : C.creamDim } }, p.points)));
+        })),
+        React.createElement("div", { className: "px-5" },
+            React.createElement(TurnDartsRow, { turnDarts: turnDarts }),
+            React.createElement(MultiplierBar, { multiplier: multiplier, setMultiplier: setMultiplier })),
+        React.createElement("div", { className: "px-5 mt-1" },
+            React.createElement("div", { className: "num-grid grid grid-cols-5 gap-1.5" }, NUM_GRID.map((n) => (React.createElement(NumBtn, { key: n, onClick: () => onThrow(n), mult: multiplier }, n)))),
+            React.createElement("div", { className: "grid grid-cols-2 gap-1.5 mt-1.5" },
+                React.createElement(NumBtn, { onClick: () => onThrow("B"), mult: multiplier === 3 ? 2 : multiplier, wide: true },
+                    "BULL ",
+                    multiplier === 1 ? "(S)" : "(D)"),
+                React.createElement("button", { onClick: () => onThrow("MISS"), className: "py-3 font-medium", style: { background: C.panel, border: `1px solid ${C.border}`, color: C.muted, fontSize: 13.5 } }, "\u30DF\u30B9"))),
+        React.createElement("div", { className: "pb-8" })));
+}
 function NumBtn({ children, onClick, mult, wide }) {
     const color = mult === 3 ? C.red : mult === 2 ? C.gold : C.borderLight;
     return (React.createElement("button", { onClick: onClick, className: "py-3 font-semibold", style: {
@@ -1164,10 +1252,16 @@ function MarkGlyph({ n }) {
 // ============================== RESULT ====================================
 function ResultScreen({ result, onRematch, onSetup, onHistory }) {
     const is01 = result.gameType === "01";
+    const isCricket = result.gameType === "cricket";
+    const isCountUp = result.gameType === "countup";
     return (React.createElement("div", { className: "flex-1 flex flex-col px-5 pt-10 sm:pt-12 pb-8" },
         React.createElement("div", { style: { color: C.muted, fontSize: 13 } },
-            is01 ? `ゼロワン ${result.variant}` : `クリケット${result.cutThroat ? " ・ カットスロート" : ""}`,
-            " \u30FB ",
+            is01
+                ? `ゼロワン ${result.variant}`
+                : isCricket
+                    ? `クリケット${result.cutThroat ? " ・ カットスロート" : ""}`
+                    : `カウントアップ（${result.maxRounds}ラウンド）`,
+            " ・ ",
             fmtDate(result.date)),
         React.createElement("div", { className: "disp mt-1 mb-6", style: { fontSize: "clamp(28px,7vw,36px)", color: C.gold } },
             result.winnerName,
@@ -1188,10 +1282,13 @@ function ResultScreen({ result, onRematch, onSetup, onHistory }) {
             React.createElement("div", { style: { fontSize: 15, fontWeight: 600, color: C.cream, marginBottom: 6 } }, p.name),
             is01 ? (React.createElement("div", { className: "flex gap-6 flex-wrap" },
                 React.createElement(Stat, { label: "80%\u30B9\u30BF\u30C3\u30C4\uFF08\u5E73\u5747\uFF09", value: p.avg80 }),
-                React.createElement(Stat, { label: "100%\u30B9\u30BF\u30C3\u30C4\uFF08\u5E73\u5747\uFF09", value: p.avg100 }))) : (React.createElement("div", { className: "flex gap-6 flex-wrap" },
+                React.createElement(Stat, { label: "100%\u30B9\u30BF\u30C3\u30C4\uFF08\u5E73\u5747\uFF09", value: p.avg100 }))) : isCricket ? (React.createElement("div", { className: "flex gap-6 flex-wrap" },
                 React.createElement(Stat, { label: "80%\u30B9\u30BF\u30C3\u30C4\uFF08MPR\uFF09", value: p.mpr80 }),
                 React.createElement(Stat, { label: "100%\u30B9\u30BF\u30C3\u30C4\uFF08MPR\uFF09", value: p.mpr100 }),
-                React.createElement(Stat, { label: result.cutThroat ? "得点（低い方が有利）" : "得点", value: p.points }))))))),
+                React.createElement(Stat, { label: result.cutThroat ? "得点（低い方が有利）" : "得点", value: p.points }))) : (React.createElement("div", { className: "flex gap-6 flex-wrap" },
+                React.createElement(Stat, { label: "\u5408\u8A08\u5F97\u70B9", value: p.totalPoints }),
+                React.createElement(Stat, { label: "80%\u30B9\u30BF\u30C3\u30C4\uFF08\u5E73\u5747\uFF09", value: p.avg80 }),
+                React.createElement(Stat, { label: "100%\u30B9\u30BF\u30C3\u30C4\uFF08\u5E73\u5747\uFF09", value: p.avg100 }))))))),
         React.createElement("div", { className: "mt-auto flex flex-col gap-3" },
             React.createElement("button", { onClick: () => {
                     playSound("tap");
@@ -1228,11 +1325,16 @@ function HistoryScreen({ history, onBack, onDelete, onClear }) {
 }
 function HistoryCard({ record, onDelete }) {
     const is01 = record.gameType === "01";
+    const isCricket = record.gameType === "cricket";
     return (React.createElement("div", { className: "px-4 py-3", style: { background: C.panel, border: `1px solid ${C.border}` } },
         React.createElement("div", { className: "flex items-center justify-between mb-2 gap-2" },
             React.createElement("div", { style: { fontSize: 12, color: C.muted } },
-                is01 ? `ゼロワン ${record.variant}` : `クリケット${record.cutThroat ? " ・ カットスロート" : ""}`,
-                " \u30FB ",
+                is01
+                    ? `ゼロワン ${record.variant}`
+                    : isCricket
+                        ? `クリケット${record.cutThroat ? " ・ カットスロート" : ""}`
+                        : `カウントアップ（${record.maxRounds}R）`,
+                " ・ ",
                 fmtDate(record.date)),
             React.createElement("button", { onClick: () => {
                     playSound("tap");
@@ -1247,14 +1349,19 @@ function HistoryCard({ record, onDelete }) {
                 "80%: ",
                 p.avg80,
                 " / 100%: ",
-                p.avg100)) : (React.createElement("span", null,
+                p.avg100)) : isCricket ? (React.createElement("span", null,
                 "MPR 80%: ",
                 p.mpr80,
                 " / 100%: ",
                 p.mpr100,
                 " (",
                 p.points,
-                "pt)")))))),
+                "pt)")) : (React.createElement("span", null,
+                p.totalPoints,
+                "pt \u30FB 80%: ",
+                p.avg80,
+                " / 100%: ",
+                p.avg100)))))),
         record.awards && record.awards.length > 0 && (React.createElement("div", { className: "flex flex-col gap-1 pt-2", style: { borderTop: `1px solid ${C.border}` } }, record.awards.map((a, i) => (React.createElement("div", { key: i, className: "flex items-center justify-between", style: { fontSize: 11 } },
             React.createElement("span", { style: { color: C.creamDim } }, a.player),
             React.createElement("span", { className: "disp", style: {
